@@ -166,6 +166,7 @@ def main():
             if now-last_report>=1 or previous!=c.phase:
                 print(json.dumps({'mode':'execute' if a.execute else 'dry-run','state':c.phase,'reason':c.reason,
                     'input_errors':[triggers.last_error,status.last_error],
+                    'feedback_status':c.feedback_status,'first_fault':c.first_fault,
                     'trigger':{s:tr.get(s) for s in SIDES} if tr else None,
                     'measured':{s:v[0] for s,v in measured.items()},'target':targets,
                     'direction':{s:('closing' if c.pressed[s] else 'opening') for s in SIDES} if c.phase=='READY' else None}),flush=True)

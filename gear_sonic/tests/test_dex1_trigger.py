@@ -94,6 +94,24 @@ class StateTests(unittest.TestCase):
         p={'time':r.t+.02,'sample_time':r.t+.02,'valid':True,'stop':False,'left':math.nan,'right':0}
         r.tick(trigger=p);self.assertEqual(r.c.phase,'FAULT_HOLD')
         r.q['left']=math.nan;self.assertNotIn('left',r.tick())
+    def test_first_fault_keeps_exact_side_position_and_age(self):
+        r=Rig();r.ready()
+        r.tick(measured={'left':(-.002,r.t+.02),'right':(.9,r.t+.02)})
+        self.assertEqual(r.c.phase,'FAULT_HOLD')
+        self.assertIn('left: outside_calibrated_range',r.c.reason)
+        first=r.c.first_fault
+        self.assertEqual(first['feedback']['left']['q'],-.002)
+        r.tick(heartbeat=None)
+        self.assertEqual(r.c.first_fault,first)
+        self.assertIn('left: outside_calibrated_range',r.c.reason)
+        r.tick(resume=True);self.assertIsNone(r.c.first_fault)
+
+    def test_stale_feedback_distinguished_from_range_error(self):
+        r=Rig();r.ready()
+        r.tick(measured={'left':(.5,r.t-1.),'right':(.5,r.t+.02)})
+        self.assertIn('left: stale_or_invalid_time',r.c.reason)
+        self.assertGreater(r.c.first_fault['feedback']['left']['age_ms'],1000)
+
     def test_invalid_endpoints_and_periods(self):
         for v in [math.nan,math.inf,0]:
             with self.assertRaises(ValueError):Limits(0,v)

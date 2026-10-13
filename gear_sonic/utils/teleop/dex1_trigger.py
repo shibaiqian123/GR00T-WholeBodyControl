@@ -30,6 +30,8 @@ class RampController:
         self.timeout = timeout
         self.phase = 'WAIT_INPUTS'
         self.reason = ''
+        self.first_fault = None
+        self.feedback_status = {}
         self.target = {}
         self.pressed = dict.fromkeys(SIDES, False)
         self.hold_captured = set()
@@ -48,6 +50,19 @@ class RampController:
         self.last_time = now
         good = {s: (s in measured and self._fresh(measured[s][1], now)
                     and self.limits[s].contains(measured[s][0])) for s in SIDES}
+        self.feedback_status = {}
+        for side in SIDES:
+            limit = self.limits[side]
+            if side not in measured:
+                self.feedback_status[side] = {"error": "missing"}
+                continue
+            q, rx = measured[side]
+            error = ("nonfinite_position" if not math.isfinite(q) else
+                     "stale_or_invalid_time" if not self._fresh(rx, now) else
+                     "outside_calibrated_range" if not limit.contains(q) else "")
+            self.feedback_status[side] = {
+                "error": error, "q": q, "age_ms": (now-rx)*1000.,
+                "min_q": min(limit.closed, limit.opened), "max_q": max(limit.closed, limit.opened)}
         tf = bool(trigger and trigger.get('valid') is True and self._fresh(trigger.get('sample_time', -math.inf), now)
                   and self._fresh(trigger.get('time', -math.inf), now))
         if tf:
@@ -57,9 +72,17 @@ class RampController:
                   and heartbeat.get('stop') is False)
         healthy = all(good.values()) and tf and hf and not trigger.get('stop', False)
         if not healthy:
-            self.reason = ('feedback missing/stale/outside calibrated range' if not all(good.values()) else
-                           'trigger invalid/stale/stop' if not tf or trigger.get('stop', False) else 'controller stopped/stale')
+            failures = [f"{side}: {info['error']}" for side, info in self.feedback_status.items() if info['error']]
+            reason = ("feedback " + "; ".join(failures) if failures else
+                      'trigger invalid/stale/stop' if not tf or trigger.get('stop', False) else 'controller stopped/stale')
+            if self.phase != 'FAULT_HOLD':
+                self.reason = reason
             if self.phase != 'WAIT_INPUTS' and self.phase != 'FAULT_HOLD':
+                self.first_fault = {"time": now, "reason": reason,
+                    "feedback": {side: dict(info) for side, info in self.feedback_status.items()},
+                    "previous_target": dict(self.target),
+                    "trigger": dict(trigger) if trigger else None,
+                    "heartbeat": dict(heartbeat) if heartbeat else None}
                 self.phase = 'FAULT_HOLD'; self.hold_captured.clear()
         if self.phase == 'WAIT_INPUTS':
             if not healthy:
@@ -76,7 +99,7 @@ class RampController:
             if resume and healthy and all(trigger[s] <= .10 for s in SIDES):
                 self.target = {s: measured[s][0] for s in SIDES}
                 self.pressed = dict.fromkeys(SIDES, False)
-                self.phase = 'READY'; self.reason = ''; dt = 0.0
+                self.phase = 'READY'; self.reason = ''; self.first_fault = None; dt = 0.0
             else:
                 return {s:self.target[s] for s in SIDES if good[s] and s in self.hold_captured}
         self.reason = ''
