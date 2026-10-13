@@ -298,6 +298,7 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
+    bool enable_dex1_heartbeat_ = false;
     MotorGainScaleConfig motor_gain_scales_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
@@ -2180,7 +2181,7 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {}, bool enable_dex1_heartbeat = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2214,6 +2215,7 @@ class G1Deploy {
                   << kd_scales << std::endl;
       }
       
+      enable_dex1_heartbeat_ = enable_dex1_heartbeat;
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
@@ -2730,6 +2732,9 @@ class G1Deploy {
           planner_thread_ptr_->Wait();
           planner_thread_ptr_.reset();
         }
+      }
+      if (enable_dex1_heartbeat_) {
+        for (auto& output : output_interfaces_) output->publish_control_status("STOP", true);
       }
       CreateDampingCommand();
       LowCommandWriter();
@@ -3832,6 +3837,12 @@ class G1Deploy {
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
     void Control() {
+      if (enable_dex1_heartbeat_) {
+        const std::string status = operator_state.stop ? "STOP" :
+            (program_state_ == ProgramState::INIT ? "INIT" :
+             program_state_ == ProgramState::WAIT_FOR_CONTROL ? "WAIT_FOR_CONTROL" : "CONTROL");
+        for (auto& output : output_interfaces_) output->publish_control_status(status, operator_state.stop);
+      }
       if (operator_state.stop) { return; }
 
       switch (program_state_) {
@@ -4190,6 +4201,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --enable-dex1-heartbeat: publish optional gripper watchdog status" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4233,9 +4245,12 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool enableDex1Heartbeat = false;
   MotorGainScaleConfig motor_gain_scales;
   for (int i = 4; i < argc; i++) {
-    if (std::string(argv[i]) == "--disable-crc-check") {
+    if (std::string(argv[i]) == "--enable-dex1-heartbeat") {
+      enableDex1Heartbeat = true;
+    } else if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
@@ -4476,6 +4491,9 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  if (enableDex1Heartbeat && outputType != "zmq" && outputType != "all") {
+    std::cerr << "Dex1 heartbeat requires --output-type zmq or all" << std::endl; return 1;
+  }
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4506,7 +4524,7 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales, enableDex1Heartbeat
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

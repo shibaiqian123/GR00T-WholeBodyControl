@@ -208,6 +208,21 @@ public:
      * Called once during init (from g1_deploy_onnx_ref.cpp) and then on every
      * control-loop tick from `publish()`.
      */
+    void publish_control_status(const std::string& state, bool stop) override {
+        // The control thread owns this socket. Stop() sends only after joining it.
+        const double now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        msgpack::sbuffer buffer;
+        msgpack::packer<msgpack::sbuffer> pk(buffer);
+        pk.pack_map(4);
+        pk.pack(std::string("seq")); pk.pack(++control_status_sequence_);
+        pk.pack(std::string("time")); pk.pack(now);
+        pk.pack(std::string("state")); pk.pack(state);
+        pk.pack(std::string("stop")); pk.pack(stop);
+        try { send_zmq_message("dex1_control_status ", buffer); }
+        catch (const zmq::error_t&) { /* External watchdog will latch on missing heartbeat. */ }
+    }
+
     void publish_config() override {
         // Lazy-init: serialise once, reuse forever.
         if (config_sbuf_cache_.size() == 0) {
@@ -230,6 +245,7 @@ public:
     }
 
 private:
+    uint64_t control_status_sequence_ = 0;
     zmq::context_t realtime_debug_context_;                ///< ZMQ context (1 I/O thread).
     std::unique_ptr<zmq::socket_t> realtime_debug_socket_; ///< ZMQ PUB socket.
 

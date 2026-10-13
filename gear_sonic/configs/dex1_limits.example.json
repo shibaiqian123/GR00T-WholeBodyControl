@@ -1,0 +1,6 @@
+{
+  "calibrated": false,
+  "units": "motor_output_radians",
+  "left": {"closed_rad": null, "open_rad": null},
+  "right": {"closed_rad": null, "open_rad": null}
+}

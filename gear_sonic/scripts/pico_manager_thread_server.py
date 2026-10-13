@@ -1912,6 +1912,7 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    dex1_triggers: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1983,6 +1984,8 @@ def run_pico_manager(
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
+    dex1_sequence = 0
+    dex1_last_sent = -float("inf")
     prev_toggle_dc = False
     prev_toggle_da = False
     try:
@@ -2096,6 +2099,24 @@ def run_pico_manager(
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
 
+            dex1_stopping = current_mode != StreamMode.OFF and new_mode == StreamMode.OFF
+            if dex1_triggers and (dex1_stopping or time.monotonic()-dex1_last_sent >= .02):
+                sample = reader.get_latest()
+                stamp = float(sample.get("timestamp_monotonic", 0.0)) if sample else 0.0
+                _, lt, rt, _, _ = get_controller_inputs(reader)
+                now = time.monotonic()
+                valid = bool(sample and 0 <= now-stamp <= .25 and
+                             np.isfinite(lt) and np.isfinite(rt) and 0 <= lt <= 1 and 0 <= rt <= 1)
+                dex1_last_sent = now
+                dex1_sequence += 1
+                packet = {"seq": dex1_sequence, "time": now, "sample_time": stamp,
+                          "left": float(lt), "right": float(rt), "valid": valid,
+                          "stop": bool(current_mode != StreamMode.OFF and new_mode == StreamMode.OFF)}
+                try:
+                    socket.send(b"dex1_trigger " + msgpack.packb(packet, use_bin_type=True), flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass  # Gripper watchdog handles a missing packet; do not block body teleop.
+
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
@@ -2105,6 +2126,9 @@ def run_pico_manager(
                 or new_mode == StreamMode.PLANNER_VR_3PT
             ):
                 planner_streamer.run_once(new_mode)
+
+            if dex1_triggers and new_mode == StreamMode.OFF:
+                time.sleep(.005)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
@@ -2149,6 +2173,12 @@ def run_pico_manager(
     except KeyboardInterrupt:
         print("\nStopping manager...")
     finally:
+        if dex1_triggers:
+            try:
+                socket.send(b"dex1_trigger " + msgpack.packb({"seq": dex1_sequence+1,
+                    "time": time.monotonic(), "sample_time": 0., "valid": False, "stop": True}, use_bin_type=True), flags=zmq.NOBLOCK)
+            except zmq.ZMQError:
+                pass
         # Cleanup resources
         reader.stop()
         three_point.close()
@@ -2251,7 +2281,10 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument("--dex1-triggers", action="store_true", help="Publish optional Dex1 trigger stream (manager only; no motor commands)")
     args = parser.parse_args()
+    if args.dex1_triggers and not args.manager:
+        parser.error("--dex1-triggers requires --manager")
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
@@ -2292,6 +2325,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            dex1_triggers=args.dex1_triggers,
         )
     else:
         # Run legacy single-thread pose streaming

@@ -214,6 +214,7 @@ show_usage() {
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
     echo ""
+    echo "  --enable-dex1-heartbeat Publish watchdog status for independent Dex1 control"
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
     echo "  real             Auto-detect robot network (192.168.123.x)"
@@ -253,6 +254,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+DEX1_ARGS=()
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
 
@@ -262,6 +264,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_usage
             exit 0
+            ;;
+        --enable-dex1-heartbeat)
+            DEX1_ARGS+=("$1")
+            shift
             ;;
         --cp|--checkpoint)
             if [[ -z "$2" ]]; then
@@ -400,7 +406,7 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ_HOST is already set from argument parsing above
 
 # Additional flags for simulation mode
-EXTRA_ARGS=()
+EXTRA_ARGS=("${DEX1_ARGS[@]}")
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS+=("--disable-crc-check")
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
