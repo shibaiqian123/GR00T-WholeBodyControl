@@ -93,7 +93,7 @@ def read_limits(path):
         raise ValueError('Limits must explicitly use motor_output_radians')
     if data.get('calibrated') is not True:
         raise ValueError('Limits must be confirmed calibrated; do not use demonstration angles')
-    return {s:Limits(float(data[s]['closed_rad']),float(data[s]['open_rad'])) for s in SIDES}
+    return {s:Limits(float(data[s]['closed_rad']),float(data[s]['open_rad']),float(data[s].get('open_margin_rad',0.0))) for s in SIDES}
 
 def demo():
     c=RampController({s:Limits(0.,1.) for s in SIDES})

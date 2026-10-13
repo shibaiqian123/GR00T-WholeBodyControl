@@ -8,10 +8,17 @@ SIDES = ('left', 'right')
 class Limits:
     closed: float
     opened: float
+    open_margin: float = 0.0
 
     def __post_init__(self):
         if not all(math.isfinite(v) for v in (self.closed, self.opened)) or self.closed == self.opened:
             raise ValueError('Each side needs distinct, finite calibrated closed/open q endpoints')
+        if not math.isfinite(self.open_margin) or not 0 <= self.open_margin < abs(self.opened-self.closed):
+            raise ValueError('Opening margin must be finite, nonnegative and smaller than calibrated travel')
+
+    @property
+    def command_open(self):
+        return self.opened + math.copysign(self.open_margin, self.closed-self.opened)
 
     def contains(self, q):
         # Feedback is measured, not a command: allow small encoder noise and
@@ -68,7 +75,8 @@ class RampController:
             self.feedback_status[side] = {
                 "error": error, "q": q, "age_ms": (now-rx)*1000.,
                 "min_q": min(limit.closed, limit.opened), "max_q": max(limit.closed, limit.opened),
-                "feedback_tolerance_rad": min(.02, .01*abs(limit.opened-limit.closed))}
+                "feedback_tolerance_rad": min(.02, .01*abs(limit.opened-limit.closed)),
+                "command_open_rad": limit.command_open, "open_margin_rad": limit.open_margin}
         tf = bool(trigger and trigger.get('valid') is True and self._fresh(trigger.get('sample_time', -math.inf), now)
                   and self._fresh(trigger.get('time', -math.inf), now))
         if tf:
@@ -119,9 +127,9 @@ class RampController:
             lim = self.limits[s]
             # Absolute position mapping: holding a partial trigger holds that
             # opening, rather than integrating a continuous closing command.
-            destination = lim.opened if opening else lim.opened + trigger[s] * (lim.closed-lim.opened)
+            destination = lim.command_open if opening else lim.command_open + trigger[s] * (lim.closed-lim.command_open)
             self.requested[s] = destination
-            step = abs(lim.opened-lim.closed) * dt / self.travel_time
+            step = abs(lim.command_open-lim.closed) * dt / self.travel_time
             delta = destination-self.target[s]
             self.motion[s] = ("holding" if abs(delta) <= 1e-9 else
                               "closing" if delta * (lim.closed-lim.opened) > 0 else "opening")
@@ -129,9 +137,9 @@ class RampController:
                 self.target[s] = destination if abs(delta) <= step + 1e-9 else lim.clamp(self.target[s] + max(-step,min(step,delta)))
             else:
                 self.target[s] = lim.clamp(destination)
-        if opening and all(abs(self.target[s]-self.limits[s].opened)<1e-9 for s in SIDES):
+        if opening and all(abs(self.target[s]-self.limits[s].command_open)<1e-9 for s in SIDES):
             # Wait for the physical grippers too: an obstruction must not arm closing.
-            if all(abs(measured[s][0]-self.limits[s].opened) <= .02*abs(self.limits[s].opened-self.limits[s].closed) for s in SIDES):
+            if all(abs(measured[s][0]-self.limits[s].command_open) <= .02*abs(self.limits[s].opened-self.limits[s].closed) for s in SIDES):
                 self.phase = 'RELEASE_TO_ARM'
         return dict(self.target)
 

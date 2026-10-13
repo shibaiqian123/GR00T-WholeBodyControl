@@ -156,6 +156,25 @@ class StateTests(unittest.TestCase):
         out=r.tick()
         self.assertEqual(r.c.phase,'FAULT_HOLD');self.assertNotIn('left',out)
 
+    def test_opening_margin_preserves_calibrated_feedback_boundary(self):
+        limit=Limits(0,5.35725,.05)
+        self.assertAlmostEqual(limit.command_open,5.30725)
+        self.assertFalse(limit.contains(5.385349))
+        self.assertTrue(limit.contains(limit.command_open+.028099))
+
+    def test_proportional_target_uses_soft_open_and_keeps_full_close(self):
+        r=Rig();r.c=RampController(dict.fromkeys(SIDES,Limits(0,1,.05)));r.ready()
+        for value in [0.,.37,.5,1.]:
+            out=r.tick(value,value)
+            self.assertAlmostEqual(out['left'],.95*(1-value))
+            self.assertAlmostEqual(out['right'],.95*(1-value))
+        self.assertEqual(r.q['left'],0.)
+
+    def test_open_margin_supports_reverse_direction_and_rejects_bad_values(self):
+        self.assertAlmostEqual(Limits(1,0,.05).command_open,.05)
+        for margin in [-.1,1.,math.nan,math.inf]:
+            with self.assertRaises(ValueError):Limits(0,1,margin)
+
     def test_invalid_endpoints_and_periods(self):
         for v in [math.nan,math.inf,0]:
             with self.assertRaises(ValueError):Limits(0,v)
