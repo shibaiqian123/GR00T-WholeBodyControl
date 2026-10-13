@@ -1,4 +1,4 @@
-"""Dex1 direct proportional-position control with a soft startup opening. No DDS, robot connection or import-time side effects."""
+"""Dex1 continuous proportional control with startup and endpoint braking. No DDS, robot connection or import-time side effects."""
 from dataclasses import dataclass
 import math
 
@@ -30,6 +30,38 @@ class Limits:
     def clamp(self, q):
         return max(min(self.closed, self.opened), min(max(self.closed, self.opened), q))
 
+def endpoint_braked_target(limit, previous, requested, measured_q, measured_dq, dt,
+                           zone=.15, max_speed=.15, min_speed=.02):
+    """Shape only outward motion in the final 15% of travel.
+
+    Normalized speeds are fractions of travel per second. A step from the
+    interior first stops at the zone boundary; measured position AND speed
+    must settle there before progressing. Reversing away from an end is direct.
+    No gains, torque limits, watchdogs or calibrated feedback bounds change.
+    """
+    span = limit.command_open-limit.closed
+    old = max(0., min(1., (previous-limit.closed)/span))
+    goal = max(0., min(1., (requested-limit.closed)/span))
+    actual = (measured_q-limit.closed)/span
+    velocity = measured_dq/span
+    high = goal > 1-zone and goal > old
+    low = goal < zone and goal < old
+    if not high and not low:
+        return limit.clamp(requested), False
+    # Mirror the closed end so the same outward logic handles both directions.
+    if low:
+        old, goal, actual, velocity = 1-old, 1-goal, 1-actual, -velocity
+    boundary=1-zone
+    if old < boundary:
+        shaped=boundary
+    elif abs(actual-old) > .02 or abs(velocity) > max_speed:
+        shaped=old  # Settle after an interior step; do not pre-run the end ramp.
+    else:
+        speed=min(max_speed,max(min_speed,2.*max(0.,1-old)))
+        shaped=min(goal,old+speed*min(.04,max(0.,dt)))
+    if low:shaped=1-shaped
+    return limit.clamp(limit.closed+shaped*span), True
+
 class RampController:
     def __init__(self, limits, travel_time=2.0, timeout=.25):
         if set(limits) != set(SIDES):
@@ -46,6 +78,7 @@ class RampController:
         self.target = {}
         self.requested = {}
         self.motion = dict.fromkeys(SIDES, "holding")
+        self.endpoint_braking = dict.fromkeys(SIDES, False)
         self.hold_captured = set()
         self.last_time = None
 
@@ -53,7 +86,7 @@ class RampController:
         return math.isfinite(timestamp) and 0 <= now - timestamp <= self.timeout
 
     def update(self, now, measured, trigger, heartbeat, resume=False):
-        """measured: side -> (q, local_rx_time); trigger/heartbeat are validated dictionaries.
+        """measured: side -> (q, local_rx_time, dq); trigger/heartbeat are validated dictionaries.
 
         Returns only sides with fresh valid feedback. STOP/invalid/stale input is
         latched until explicit resume with both triggers released and live controller.
@@ -61,19 +94,22 @@ class RampController:
         dt = 0.0 if self.last_time is None else min(.04, max(0., now-self.last_time))
         self.last_time = now
         good = {s: (s in measured and self._fresh(measured[s][1], now)
-                    and self.limits[s].contains(measured[s][0])) for s in SIDES}
+                    and self.limits[s].contains(measured[s][0])
+                    and (len(measured[s]) < 3 or math.isfinite(measured[s][2]))) for s in SIDES}
         self.feedback_status = {}
         for side in SIDES:
             limit = self.limits[side]
             if side not in measured:
                 self.feedback_status[side] = {"error": "missing"}
                 continue
-            q, rx = measured[side]
+            q, rx = measured[side][:2]
+            dq = measured[side][2] if len(measured[side]) >= 3 else 0.
             error = ("nonfinite_position" if not math.isfinite(q) else
+                     "nonfinite_velocity" if not math.isfinite(dq) else
                      "stale_or_invalid_time" if not self._fresh(rx, now) else
                      "outside_calibrated_range" if not limit.contains(q) else "")
             self.feedback_status[side] = {
-                "error": error, "q": q, "age_ms": (now-rx)*1000.,
+                "error": error, "q": q, "dq": dq, "age_ms": (now-rx)*1000.,
                 "min_q": min(limit.closed, limit.opened), "max_q": max(limit.closed, limit.opened),
                 "feedback_tolerance_rad": min(.02, .01*abs(limit.opened-limit.closed)),
                 "command_open_rad": limit.command_open, "open_margin_rad": limit.open_margin}
@@ -136,7 +172,9 @@ class RampController:
             if opening:
                 self.target[s] = destination if abs(delta) <= step + 1e-9 else lim.clamp(self.target[s] + max(-step,min(step,delta)))
             else:
-                self.target[s] = lim.clamp(destination)
+                dq = measured[s][2] if len(measured[s]) >= 3 else 0.
+                self.target[s], self.endpoint_braking[s] = endpoint_braked_target(
+                    lim, self.target[s], destination, measured[s][0], dq, dt)
         if opening and all(abs(self.target[s]-self.limits[s].command_open)<1e-9 for s in SIDES):
             # Wait for the physical grippers too: an obstruction must not arm closing.
             if all(abs(measured[s][0]-self.limits[s].command_open) <= .02*abs(self.limits[s].opened-self.limits[s].closed) for s in SIDES):

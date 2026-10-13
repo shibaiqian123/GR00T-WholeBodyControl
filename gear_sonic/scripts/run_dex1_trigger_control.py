@@ -34,10 +34,11 @@ class DdsGrippers:
     def on_state(self, side, msg):
         try:
             q=float(msg.states[0].q) if len(msg.states)==1 else math.nan
+            dq=float(msg.states[0].dq) if len(msg.states)==1 else math.nan
         except (AttributeError,TypeError,ValueError):
-            q=math.nan
+            q=dq=math.nan
         with self.lock:
-            self.measured[side]=(q,time.monotonic())
+            self.measured[side]=(q,time.monotonic(),dq)
     def snapshot(self):
         with self.lock:return dict(self.measured)
     def write(self, targets):
@@ -170,6 +171,7 @@ def main():
                     'trigger':{s:tr.get(s) for s in SIDES} if tr else None,
                     'measured':{s:v[0] for s,v in measured.items()},'target':targets,
                     'requested_target':c.requested if c.phase=='READY' else None,
+                    'endpoint_braking':c.endpoint_braking if c.phase=='READY' else None,
                     'direction':c.motion if c.phase=='READY' else None}),flush=True)
                 previous=c.phase;last_report=now
             deadline+=.02

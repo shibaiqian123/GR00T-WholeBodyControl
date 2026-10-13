@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import msgpack
 import zmq
-from gear_sonic.utils.teleop.dex1_trigger import Limits, RampController, SIDES, TriggerFrameClock
+from gear_sonic.utils.teleop.dex1_trigger import Limits, RampController, SIDES, TriggerFrameClock, endpoint_braked_target
 from gear_sonic.scripts.run_dex1_trigger_control import DdsGrippers, PacketReader
 
 class Rig:
@@ -38,9 +38,9 @@ class StateTests(unittest.TestCase):
         r=Rig()
         for _ in range(150):r.tick(follow=False)
         self.assertEqual(r.c.phase,'OPENING')
-    def test_normal_tracking_has_no_slew_delay(self):
+    def test_middle_tracking_has_no_slew_delay(self):
         r=Rig();r.ready()
-        for value in [1.,.37,.81,.023,0.]:
+        for value in [.21,.37,.81,.5]:
             out=r.tick(value,0)
             self.assertAlmostEqual(out['left'],1-value)
             self.assertEqual(out['right'],1.)
@@ -71,7 +71,9 @@ class StateTests(unittest.TestCase):
 
     def test_reversed_endpoint_sign(self):
         r=Rig(True);r.ready();self.assertEqual(r.q['right'],0)
-        r.tick(0,1);self.assertAlmostEqual(r.q['right'],1.)
+        r.tick(0,1);self.assertAlmostEqual(r.q['right'],.85)
+        for _ in range(250):r.tick(0,1)
+        self.assertAlmostEqual(r.q['right'],1.)
     def test_startup_lag_does_not_catch_up(self):
         r=Rig();r.tick();r.tick(delta=2.)
         self.assertAlmostEqual(r.q['left'],.52)
@@ -165,7 +167,7 @@ class StateTests(unittest.TestCase):
     def test_proportional_target_uses_soft_open_and_keeps_full_close(self):
         r=Rig();r.c=RampController(dict.fromkeys(SIDES,Limits(0,1,.05)));r.ready()
         for value in [0.,.37,.5,1.]:
-            out=r.tick(value,value)
+            for _ in range(250):out=r.tick(value,value)
             self.assertAlmostEqual(out['left'],.95*(1-value))
             self.assertAlmostEqual(out['right'],.95*(1-value))
         self.assertEqual(r.q['left'],0.)
@@ -180,6 +182,41 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(ValueError):Limits(0,v)
         for t in [0,-1,math.inf]:
             with self.assertRaises(ValueError):RampController(dict.fromkeys(SIDES,Limits(0,1)),t)
+
+class EndpointBrakeTests(unittest.TestCase):
+    def test_fast_release_stages_at_open_boundary(self):
+        q,active=endpoint_braked_target(Limits(0,1),0,1,0,0,.02)
+        self.assertTrue(active);self.assertAlmostEqual(q,.85)
+    def test_fast_squeeze_stages_at_closed_boundary(self):
+        q,active=endpoint_braked_target(Limits(0,1),1,0,1,0,.02)
+        self.assertTrue(active);self.assertAlmostEqual(q,.15)
+    def test_waits_for_position_and_speed_before_advancing(self):
+        for measured,dq in [(.5,0),(.85,1),(.90,-1)]:
+            q,active=endpoint_braked_target(Limits(0,1),.85,1,measured,dq,.02)
+            self.assertAlmostEqual(q,.85);self.assertTrue(active)
+        q,_=endpoint_braked_target(Limits(0,1),.85,1,.85,.05,.02)
+        self.assertGreater(q,.85);self.assertLessEqual(q,.85300001)
+    def test_speed_tapers_near_end(self):
+        a,_=endpoint_braked_target(Limits(0,1),.85,1,.85,0,.02)
+        b,_=endpoint_braked_target(Limits(0,1),.99,1,.99,0,.02)
+        self.assertLess(b-.99,a-.85)
+    def test_retreat_and_middle_are_direct(self):
+        for old,goal in [(.99,.9),(.01,.1),(.2,.6),(.6,.3)]:
+            q,active=endpoint_braked_target(Limits(0,1),old,goal,old,0,.02)
+            self.assertAlmostEqual(q,goal);self.assertFalse(active)
+    def test_repeated_cycles_reach_endpoints_without_fault(self):
+        r=Rig();r.ready()
+        for _ in range(3):
+            for v in [1.,0.]:
+                for _ in range(250):r.tick(v,1-v)
+                self.assertEqual(r.c.phase,'READY')
+                self.assertAlmostEqual(r.q['left'],1-v)
+                self.assertAlmostEqual(r.q['right'],v)
+    def test_nonfinite_measured_velocity_is_rejected(self):
+        r=Rig();r.ready()
+        r.tick(measured={'left':(.5,r.t+.02,math.nan),'right':(.5,r.t+.02,0.)})
+        self.assertEqual(r.c.phase,'FAULT_HOLD')
+        self.assertIn('nonfinite_velocity',r.c.reason)
 
 class TriggerClockTests(unittest.TestCase):
     def test_cached_frame_not_fresh_at_start(self):
