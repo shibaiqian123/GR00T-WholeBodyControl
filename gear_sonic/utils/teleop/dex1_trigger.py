@@ -14,7 +14,11 @@ class Limits:
             raise ValueError('Each side needs distinct, finite calibrated closed/open q endpoints')
 
     def contains(self, q):
-        return math.isfinite(q) and min(self.closed, self.opened) - 1e-6 <= q <= max(self.closed, self.opened) + 1e-6
+        # Feedback is measured, not a command: allow small encoder noise and
+        # endpoint tracking overshoot (at most 0.02 rad / 1% of travel).
+        # Every command, including startup/resume/hold, stays strictly clamped.
+        tolerance = min(0.02, 0.01 * abs(self.opened-self.closed))
+        return math.isfinite(q) and min(self.closed, self.opened) - tolerance <= q <= max(self.closed, self.opened) + tolerance
 
     def clamp(self, q):
         return max(min(self.closed, self.opened), min(max(self.closed, self.opened), q))
@@ -62,7 +66,8 @@ class RampController:
                      "outside_calibrated_range" if not limit.contains(q) else "")
             self.feedback_status[side] = {
                 "error": error, "q": q, "age_ms": (now-rx)*1000.,
-                "min_q": min(limit.closed, limit.opened), "max_q": max(limit.closed, limit.opened)}
+                "min_q": min(limit.closed, limit.opened), "max_q": max(limit.closed, limit.opened),
+                "feedback_tolerance_rad": min(.02, .01*abs(limit.opened-limit.closed))}
         tf = bool(trigger and trigger.get('valid') is True and self._fresh(trigger.get('sample_time', -math.inf), now)
                   and self._fresh(trigger.get('time', -math.inf), now))
         if tf:
@@ -87,17 +92,17 @@ class RampController:
         if self.phase == 'WAIT_INPUTS':
             if not healthy:
                 return {}
-            self.target = {s: measured[s][0] for s in SIDES}
+            self.target = {s: self.limits[s].clamp(measured[s][0]) for s in SIDES}
             self.phase = 'OPENING'
             dt = 0.0
         if self.phase == 'FAULT_HOLD':
             for s in SIDES:
                 if good[s] and s not in self.hold_captured:
-                    self.target[s] = measured[s][0]; self.hold_captured.add(s)
+                    self.target[s] = self.limits[s].clamp(measured[s][0]); self.hold_captured.add(s)
                 elif not good[s]:
                     self.hold_captured.discard(s)
             if resume and healthy and all(trigger[s] <= .10 for s in SIDES):
-                self.target = {s: measured[s][0] for s in SIDES}
+                self.target = {s: self.limits[s].clamp(measured[s][0]) for s in SIDES}
                 self.pressed = dict.fromkeys(SIDES, False)
                 self.phase = 'READY'; self.reason = ''; self.first_fault = None; dt = 0.0
             else:

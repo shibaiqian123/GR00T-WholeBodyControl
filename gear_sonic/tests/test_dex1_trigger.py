@@ -96,11 +96,11 @@ class StateTests(unittest.TestCase):
         r.q['left']=math.nan;self.assertNotIn('left',r.tick())
     def test_first_fault_keeps_exact_side_position_and_age(self):
         r=Rig();r.ready()
-        r.tick(measured={'left':(-.002,r.t+.02),'right':(.9,r.t+.02)})
+        r.tick(measured={'left':(-.03,r.t+.02),'right':(.9,r.t+.02)})
         self.assertEqual(r.c.phase,'FAULT_HOLD')
         self.assertIn('left: outside_calibrated_range',r.c.reason)
         first=r.c.first_fault
-        self.assertEqual(first['feedback']['left']['q'],-.002)
+        self.assertEqual(first['feedback']['left']['q'],-.03)
         r.tick(heartbeat=None)
         self.assertEqual(r.c.first_fault,first)
         self.assertIn('left: outside_calibrated_range',r.c.reason)
@@ -111,6 +111,31 @@ class StateTests(unittest.TestCase):
         r.tick(measured={'left':(.5,r.t-1.),'right':(.5,r.t+.02)})
         self.assertIn('left: stale_or_invalid_time',r.c.reason)
         self.assertGreater(r.c.first_fault['feedback']['left']['age_ms'],1000)
+
+    def test_both_endpoints_allow_small_feedback_error_and_reverse(self):
+        r=Rig();r.ready()
+        r.q.update(left=1.002,right=1.002)
+        r.tick(1,1)
+        self.assertEqual(r.c.phase,'READY')
+        self.assertLess(r.q['left'],1)
+        for _ in range(110):r.tick(1,1)
+        r.q.update(left=-.002,right=-.002)
+        out=r.tick(0,0)
+        self.assertEqual(r.c.phase,'READY')
+        self.assertGreater(out['left'],0)
+        self.assertGreater(out['right'],0)
+        self.assertTrue(all(0<=q<=1 for q in out.values()))
+
+    def test_start_and_hold_never_command_outside_limits(self):
+        r=Rig();r.q.update(left=-.002,right=1.002)
+        out=r.tick();self.assertEqual(out,{'left':0,'right':1})
+        out=r.tick(heartbeat=None)
+        self.assertTrue(all(0<=q<=1 for q in out.values()))
+
+    def test_large_endpoint_violation_still_latches(self):
+        r=Rig();r.ready();r.q['left']=1.03
+        out=r.tick()
+        self.assertEqual(r.c.phase,'FAULT_HOLD');self.assertNotIn('left',out)
 
     def test_invalid_endpoints_and_periods(self):
         for v in [math.nan,math.inf,0]:
