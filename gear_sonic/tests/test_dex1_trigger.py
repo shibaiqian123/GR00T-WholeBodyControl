@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import msgpack
 import zmq
-from gear_sonic.utils.teleop.dex1_trigger import Limits, RampController, SIDES
+from gear_sonic.utils.teleop.dex1_trigger import Limits, RampController, SIDES, TriggerFrameClock
 from gear_sonic.scripts.run_dex1_trigger_control import DdsGrippers, PacketReader
 
 class Rig:
@@ -142,6 +142,35 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(ValueError):Limits(0,v)
         for t in [0,-1,math.inf]:
             with self.assertRaises(ValueError):RampController(dict.fromkeys(SIDES,Limits(0,1)),t)
+
+class TriggerClockTests(unittest.TestCase):
+    def test_cached_frame_not_fresh_at_start(self):
+        c=TriggerFrameClock()
+        self.assertEqual(c.observe(100,10.),(0.,False))
+        self.assertEqual(c.observe(100,10.2),(0.,False))
+    def test_advancing_input_is_fresh_without_body_updates(self):
+        c=TriggerFrameClock();c.observe(100,10.)
+        for i in range(1,101):
+            stamp,valid=c.observe(100+i,10+i*.02)
+            self.assertTrue(valid);self.assertAlmostEqual(stamp,10+i*.02)
+    def test_repeated_read_does_not_refresh_stale_frame(self):
+        c=TriggerFrameClock();c.observe(100,10.);c.observe(101,10.02)
+        self.assertTrue(c.observe(101,10.2)[1])
+        self.assertFalse(c.observe(101,10.28)[1])
+        self.assertAlmostEqual(c.observe(101,11.)[0],10.02)
+    def test_reset_or_invalid_source_requires_fresh_advance(self):
+        c=TriggerFrameClock();c.observe(100,10.);c.observe(101,10.02)
+        self.assertFalse(c.observe(50,10.04)[1])
+        self.assertTrue(c.observe(51,10.06)[1])
+        self.assertFalse(c.observe(0,10.08)[1])
+        self.assertFalse(c.observe(math.nan,10.1)[1])
+    def test_real_sdk_stall_still_latches_gripper(self):
+        r=Rig();r.ready();c=TriggerFrameClock()
+        c.observe(100,r.t);stamp,valid=c.observe(101,r.t+.01)
+        for _ in range(20):
+            now=r.t+.02;stamp,valid=c.observe(101,now)
+            r.tick(trigger={'time':now,'sample_time':stamp,'valid':valid,'stop':False,'left':0.,'right':0.})
+        self.assertEqual(r.c.phase,'FAULT_HOLD')
 
 class TransportTests(unittest.TestCase):
     def sdk(self):

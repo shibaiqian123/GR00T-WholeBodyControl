@@ -1984,6 +1984,8 @@ def run_pico_manager(
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
+    from gear_sonic.utils.teleop.dex1_trigger import TriggerFrameClock
+    dex1_frame_clock = TriggerFrameClock()
     dex1_sequence = 0
     dex1_last_sent = -float("inf")
     prev_toggle_dc = False
@@ -2101,16 +2103,19 @@ def run_pico_manager(
 
             dex1_stopping = current_mode != StreamMode.OFF and new_mode == StreamMode.OFF
             if dex1_triggers and (dex1_stopping or time.monotonic()-dex1_last_sent >= .02):
-                sample = reader.get_latest()
-                stamp = float(sample.get("timestamp_monotonic", 0.0)) if sample else 0.0
+                # Track the actual SDK input frame, not the background body-pose
+                # worker (which can stall while controller frames remain fresh).
+                source_stamp_ns = reader.get_timestamp_ns()
                 _, lt, rt, _, _ = get_controller_inputs(reader)
                 now = time.monotonic()
-                valid = bool(sample and 0 <= now-stamp <= .25 and
-                             np.isfinite(lt) and np.isfinite(rt) and 0 <= lt <= 1 and 0 <= rt <= 1)
+                stamp, fresh = dex1_frame_clock.observe(source_stamp_ns, now)
+                valid = bool(fresh and np.isfinite(lt) and np.isfinite(rt)
+                             and 0 <= lt <= 1 and 0 <= rt <= 1)
                 dex1_last_sent = now
                 dex1_sequence += 1
                 packet = {"seq": dex1_sequence, "time": now, "sample_time": stamp,
                           "left": float(lt), "right": float(rt), "valid": valid,
+                          "source_timestamp_ns": int(source_stamp_ns), "freshness_source": "sdk_input_frame",
                           "stop": bool(current_mode != StreamMode.OFF and new_mode == StreamMode.OFF)}
                 try:
                     socket.send(b"dex1_trigger " + msgpack.packb(packet, use_bin_type=True), flags=zmq.NOBLOCK)

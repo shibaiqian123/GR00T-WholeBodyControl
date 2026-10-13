@@ -127,3 +127,27 @@ class RampController:
             if all(abs(measured[s][0]-self.limits[s].opened) <= .02*abs(self.limits[s].opened-self.limits[s].closed) for s in SIDES):
                 self.phase = 'RELEASE_TO_ARM'
         return dict(self.target)
+
+
+class TriggerFrameClock:
+    """Freshness of SDK input frames, independent of the body processing worker.
+
+    Observing a cached timestamp for the first time does NOT make it fresh.
+    At least one forward advance is required. Re-reading never refreshes age.
+    """
+    def __init__(self):
+        self.last_stamp = None
+        self.last_advance = None
+
+    def observe(self, stamp_ns, now):
+        if not isinstance(stamp_ns, (int, float)) or not math.isfinite(stamp_ns) or stamp_ns <= 0:
+            self.last_stamp = None
+            self.last_advance = None
+            return 0.0, False
+        if self.last_stamp is None or stamp_ns < self.last_stamp:
+            self.last_advance = None
+        elif stamp_ns > self.last_stamp:
+            self.last_advance = now
+        self.last_stamp = stamp_ns
+        fresh = self.last_advance is not None and 0 <= now-self.last_advance <= .25
+        return self.last_advance if self.last_advance is not None else 0.0, fresh
