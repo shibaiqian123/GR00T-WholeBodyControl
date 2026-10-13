@@ -31,8 +31,8 @@ class Limits:
         return max(min(self.closed, self.opened), min(max(self.closed, self.opened), q))
 
 def endpoint_braked_target(limit, previous, requested, measured_q, measured_dq, dt,
-                           zone=.15, max_speed=.15, min_speed=.02):
-    """Shape only outward motion in the final 15% of travel.
+                           zone=.05, max_speed=.15, min_speed=.02):
+    """Shape only outward motion in the final 5% of travel.
 
     Normalized speeds are fractions of travel per second. A step from the
     interior first stops at the zone boundary; measured position AND speed

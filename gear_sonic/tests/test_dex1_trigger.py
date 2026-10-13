@@ -71,7 +71,7 @@ class StateTests(unittest.TestCase):
 
     def test_reversed_endpoint_sign(self):
         r=Rig(True);r.ready();self.assertEqual(r.q['right'],0)
-        r.tick(0,1);self.assertAlmostEqual(r.q['right'],.85)
+        r.tick(0,1);self.assertAlmostEqual(r.q['right'],.95)
         for _ in range(250):r.tick(0,1)
         self.assertAlmostEqual(r.q['right'],1.)
     def test_startup_lag_does_not_catch_up(self):
@@ -186,22 +186,22 @@ class StateTests(unittest.TestCase):
 class EndpointBrakeTests(unittest.TestCase):
     def test_fast_release_stages_at_open_boundary(self):
         q,active=endpoint_braked_target(Limits(0,1),0,1,0,0,.02)
-        self.assertTrue(active);self.assertAlmostEqual(q,.85)
+        self.assertTrue(active);self.assertAlmostEqual(q,.95)
     def test_fast_squeeze_stages_at_closed_boundary(self):
         q,active=endpoint_braked_target(Limits(0,1),1,0,1,0,.02)
-        self.assertTrue(active);self.assertAlmostEqual(q,.15)
+        self.assertTrue(active);self.assertAlmostEqual(q,.05)
     def test_waits_for_position_and_speed_before_advancing(self):
-        for measured,dq in [(.5,0),(.85,1),(.90,-1)]:
-            q,active=endpoint_braked_target(Limits(0,1),.85,1,measured,dq,.02)
-            self.assertAlmostEqual(q,.85);self.assertTrue(active)
-        q,_=endpoint_braked_target(Limits(0,1),.85,1,.85,.05,.02)
-        self.assertGreater(q,.85);self.assertLessEqual(q,.85300001)
+        for measured,dq in [(.5,0),(.95,1),(.99,-1)]:
+            q,active=endpoint_braked_target(Limits(0,1),.95,1,measured,dq,.02)
+            self.assertAlmostEqual(q,.95);self.assertTrue(active)
+        q,_=endpoint_braked_target(Limits(0,1),.95,1,.95,.05,.02)
+        self.assertGreater(q,.95);self.assertLessEqual(q,.95200001)
     def test_speed_tapers_near_end(self):
-        a,_=endpoint_braked_target(Limits(0,1),.85,1,.85,0,.02)
+        a,_=endpoint_braked_target(Limits(0,1),.95,1,.95,0,.02)
         b,_=endpoint_braked_target(Limits(0,1),.99,1,.99,0,.02)
-        self.assertLess(b-.99,a-.85)
+        self.assertLess(b-.99,a-.95)
     def test_retreat_and_middle_are_direct(self):
-        for old,goal in [(.99,.9),(.01,.1),(.2,.6),(.6,.3)]:
+        for old,goal in [(.99,.9),(.01,.1),(.2,.6),(.6,.3),(.5,.90),(.5,.10)]:
             q,active=endpoint_braked_target(Limits(0,1),old,goal,old,0,.02)
             self.assertAlmostEqual(q,goal);self.assertFalse(active)
     def test_repeated_cycles_reach_endpoints_without_fault(self):
