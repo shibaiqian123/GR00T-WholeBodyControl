@@ -1,4 +1,4 @@
-"""Dex1 proportional-position state machine with slew limiting. No DDS, robot connection or import-time side effects."""
+"""Dex1 direct proportional-position control with a soft startup opening. No DDS, robot connection or import-time side effects."""
 from dataclasses import dataclass
 import math
 
@@ -105,7 +105,8 @@ class RampController:
             if resume and healthy and all(trigger[s] <= .10 for s in SIDES):
                 self.target = {s: self.limits[s].clamp(measured[s][0]) for s in SIDES}
                 self.motion = dict.fromkeys(SIDES, "holding")
-                self.phase = 'READY'; self.reason = ''; self.first_fault = None; dt = 0.0
+                self.phase = 'READY'; self.reason = ''; self.first_fault = None
+                return dict(self.target)
             else:
                 return {s:self.target[s] for s in SIDES if good[s] and s in self.hold_captured}
         self.reason = ''
@@ -124,7 +125,10 @@ class RampController:
             delta = destination-self.target[s]
             self.motion[s] = ("holding" if abs(delta) <= 1e-9 else
                               "closing" if delta * (lim.closed-lim.opened) > 0 else "opening")
-            self.target[s] = destination if abs(delta) <= step + 1e-9 else lim.clamp(self.target[s] + max(-step,min(step,delta)))
+            if opening:
+                self.target[s] = destination if abs(delta) <= step + 1e-9 else lim.clamp(self.target[s] + max(-step,min(step,delta)))
+            else:
+                self.target[s] = lim.clamp(destination)
         if opening and all(abs(self.target[s]-self.limits[s].opened)<1e-9 for s in SIDES):
             # Wait for the physical grippers too: an obstruction must not arm closing.
             if all(abs(measured[s][0]-self.limits[s].opened) <= .02*abs(self.limits[s].opened-self.limits[s].closed) for s in SIDES):

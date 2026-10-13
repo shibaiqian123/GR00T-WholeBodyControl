@@ -4,7 +4,7 @@
 左食指扳机控制左夹爪，右食指扳机控制右夹爪；握把键不参与。
 扳机深度连续映射到标定电机位置：0 全开，0.5 半行程，1 全闭。保持半按就保持对应位置。
 公式：q_des = open_rad + trigger * (closed_rad - open_rad)。
-保留平滑速度限制，默认完整行程约 2 秒；--travel-time 调整的是限速，不是按住的闭合计时。
+正常控制不做软件速度限制或位置插值，每周期直接发送比例位置目标；启动自动张开单独保留约 2 秒的渐进过程。
 
 ## 前提与行程
 
@@ -82,7 +82,7 @@ source .venv_teleop/bin/activate
 python -m gear_sonic.scripts.run_dex1_trigger_control \
   --interface enx6c1ff7b8d821 \
   --limits /absolute/path/to/confirmed-dex1-limits.json \
-  --travel-time 2
+  --startup-open-time 2
 ```
 
 默认 DRY-RUN，只接收实际反馈、打印目标，不创建电机命令发布器。
@@ -100,7 +100,7 @@ python -m gear_sonic.scripts.run_dex1_trigger_control \
 - WAIT_INPUTS：等待所有输入有效，不发布命令。
 - OPENING：从实测位置开始，缓慢打开。暂不接受闭合；两侧实测开口达到端点附近才进入下一阶段。
 - RELEASE_TO_ARM：要求左右扳机都松开一次。
-- READY：扳机 0～1 连续对应全开到全闭的电机行程；保持部分按压则停止在对应目标。日志 requested_target 是比例目标，target 是限速后的实际发送目标；到位时 direction 为 holding。
+- READY：扳机 0～1 连续对应全开到全闭的电机行程；保持部分按压则停止在对应目标。日志 requested_target 是比例目标，target 是实际发送的目标，正常跟随时与 requested_target 相同；到位时 direction 为 holding。
 - FAULT_HOLD：停止推进目标，以最近有效实测位置为保持目标。恢复数据不会自动恢复动作。
 
 头显数据/扳机、控制器心跳超过 250 ms 未更新，O、PICO 停止组合键、无效数据都会锁存保持。
@@ -153,3 +153,10 @@ O 停止身体后，不要关闭夹爪进程：它继续发送保持目标。
 按用户更新要求，已将二值持续开合改为绝对比例位置目标。33 项自动测试通过，包含
 保持半按多秒不继续闭合、25%/75%/50%/100%/0% 往返、左右独立、小于原阈值的轻按也按比例响应。
 仅需重启夹爪进程使新控制逻辑生效；仍须用空夹爪验证实际位置跟随。
+
+
+### 去除正常跟随限速
+
+按用户要求，READY 阶段直接采用连续比例目标，不再经过两秒斜坡。
+`--startup-open-time`（兼容别名 `--travel-time`）仅影响启动自动张开，不影响正常扳机跟随。
+故障保持、手动恢复、端点命令限幅和超时仍保留。目标无软件斜坡不代表机械响应或网络延迟为零。

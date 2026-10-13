@@ -38,19 +38,17 @@ class StateTests(unittest.TestCase):
         r=Rig()
         for _ in range(150):r.tick(follow=False)
         self.assertEqual(r.c.phase,'OPENING')
-    def test_full_travel_two_seconds_independent_and_clamped(self):
+    def test_normal_tracking_has_no_slew_delay(self):
         r=Rig();r.ready()
-        for _ in range(50):r.tick(1,0)
-        self.assertAlmostEqual(r.q['left'],.5,places=7);self.assertEqual(r.q['right'],1)
-        for _ in range(50):r.tick(1,0)
-        self.assertAlmostEqual(r.q['left'],0,places=7)
-        for _ in range(30):r.tick(1,0)
-        self.assertEqual(r.q['left'],0)
+        for value in [1.,.37,.81,.023,0.]:
+            out=r.tick(value,0)
+            self.assertAlmostEqual(out['left'],1-value)
+            self.assertEqual(out['right'],1.)
     def test_release_reverses_without_reset(self):
         r=Rig();r.ready()
-        for _ in range(40):r.tick(1)
-        before=r.q['left'];r.tick();self.assertAlmostEqual(r.q['left'],before+.01)
-        r.tick(1);self.assertAlmostEqual(r.q['left'],before)
+        r.tick(.8);self.assertAlmostEqual(r.q['left'],.2)
+        r.tick(.3);self.assertAlmostEqual(r.q['left'],.7)
+        r.tick(.6);self.assertAlmostEqual(r.q['left'],.4)
     def test_half_trigger_holds_half_position_indefinitely(self):
         r=Rig();r.ready()
         for _ in range(300):r.tick(.5,0)
@@ -73,10 +71,16 @@ class StateTests(unittest.TestCase):
 
     def test_reversed_endpoint_sign(self):
         r=Rig(True);r.ready();self.assertEqual(r.q['right'],0)
-        r.tick(0,1);self.assertAlmostEqual(r.q['right'],.01)
-    def test_lag_does_not_catch_up(self):
-        r=Rig();r.ready();r.tick(1,delta=2.)
-        self.assertAlmostEqual(r.q['left'],.98)
+        r.tick(0,1);self.assertAlmostEqual(r.q['right'],1.)
+    def test_startup_lag_does_not_catch_up(self):
+        r=Rig();r.tick();r.tick(delta=2.)
+        self.assertAlmostEqual(r.q['left'],.52)
+    def test_only_startup_full_travel_takes_two_seconds(self):
+        r=Rig();r.q=dict.fromkeys(SIDES,0.);r.tick()
+        for _ in range(50):r.tick()
+        self.assertAlmostEqual(r.q['left'],.5)
+        for _ in range(50):r.tick()
+        self.assertAlmostEqual(r.q['left'],1.)
     def test_stop_holds_measured_not_previous_target(self):
         r=Rig();r.ready();r.q['left']=.7
         hb={'time':r.t+.02,'state':'STOP','stop':True}

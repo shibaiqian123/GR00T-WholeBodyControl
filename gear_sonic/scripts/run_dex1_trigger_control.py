@@ -112,7 +112,7 @@ def main():
     p.add_argument('--interface',help='Explicit robot NIC; no auto-detection')
     p.add_argument('--domain',type=int,default=0)
     p.add_argument('--limits',type=Path,help='JSON with confirmed calibrated endpoints, radians')
-    p.add_argument('--travel-time',type=float,default=2.,help='Full-travel slew time in seconds; trigger depth sets absolute desired position')
+    p.add_argument('--startup-open-time','--travel-time',dest='travel_time',type=float,default=2.,help='Startup opening time only; normal trigger tracking is direct, without slew limiting')
     p.add_argument('--feedback-timeout',type=float,default=.25)
     p.add_argument('--trigger-port',type=int,default=5556)
     p.add_argument('--status-port',type=int,default=5557)
