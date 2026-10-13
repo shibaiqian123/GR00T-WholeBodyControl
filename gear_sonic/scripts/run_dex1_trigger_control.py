@@ -1,4 +1,4 @@
-"""Independent Dex1-1 controller. Dry-run unless --execute is explicitly supplied.
+"""Independent proportional-trigger Dex1-1 position controller. Dry-run unless --execute is explicitly supplied.
 
 All three processes must run on the same Linux host (shared monotonic clock).
 This process stays alive in FAULT_HOLD after the body controller exits.
@@ -112,7 +112,7 @@ def main():
     p.add_argument('--interface',help='Explicit robot NIC; no auto-detection')
     p.add_argument('--domain',type=int,default=0)
     p.add_argument('--limits',type=Path,help='JSON with confirmed calibrated endpoints, radians')
-    p.add_argument('--travel-time',type=float,default=2.)
+    p.add_argument('--travel-time',type=float,default=2.,help='Full-travel slew time in seconds; trigger depth sets absolute desired position')
     p.add_argument('--feedback-timeout',type=float,default=.25)
     p.add_argument('--trigger-port',type=int,default=5556)
     p.add_argument('--status-port',type=int,default=5557)
@@ -169,7 +169,8 @@ def main():
                     'feedback_status':c.feedback_status,'first_fault':c.first_fault,
                     'trigger':{s:tr.get(s) for s in SIDES} if tr else None,
                     'measured':{s:v[0] for s,v in measured.items()},'target':targets,
-                    'direction':{s:('closing' if c.pressed[s] else 'opening') for s in SIDES} if c.phase=='READY' else None}),flush=True)
+                    'requested_target':c.requested if c.phase=='READY' else None,
+                    'direction':c.motion if c.phase=='READY' else None}),flush=True)
                 previous=c.phase;last_report=now
             deadline+=.02
             if now-deadline>.04:deadline=now

@@ -1,4 +1,4 @@
-"""Dex1 ramp state machine. No DDS, robot connection or import-time side effects."""
+"""Dex1 proportional-position state machine with slew limiting. No DDS, robot connection or import-time side effects."""
 from dataclasses import dataclass
 import math
 
@@ -37,7 +37,8 @@ class RampController:
         self.first_fault = None
         self.feedback_status = {}
         self.target = {}
-        self.pressed = dict.fromkeys(SIDES, False)
+        self.requested = {}
+        self.motion = dict.fromkeys(SIDES, "holding")
         self.hold_captured = set()
         self.last_time = None
 
@@ -103,7 +104,7 @@ class RampController:
                     self.hold_captured.discard(s)
             if resume and healthy and all(trigger[s] <= .10 for s in SIDES):
                 self.target = {s: self.limits[s].clamp(measured[s][0]) for s in SIDES}
-                self.pressed = dict.fromkeys(SIDES, False)
+                self.motion = dict.fromkeys(SIDES, "holding")
                 self.phase = 'READY'; self.reason = ''; self.first_fault = None; dt = 0.0
             else:
                 return {s:self.target[s] for s in SIDES if good[s] and s in self.hold_captured}
@@ -115,12 +116,14 @@ class RampController:
         opening = self.phase == 'OPENING'
         for s in SIDES:
             lim = self.limits[s]
-            if not opening:
-                if trigger[s] >= .15: self.pressed[s] = True
-                elif trigger[s] <= .10: self.pressed[s] = False
-            destination = lim.opened if opening or not self.pressed[s] else lim.closed
+            # Absolute position mapping: holding a partial trigger holds that
+            # opening, rather than integrating a continuous closing command.
+            destination = lim.opened if opening else lim.opened + trigger[s] * (lim.closed-lim.opened)
+            self.requested[s] = destination
             step = abs(lim.opened-lim.closed) * dt / self.travel_time
             delta = destination-self.target[s]
+            self.motion[s] = ("holding" if abs(delta) <= 1e-9 else
+                              "closing" if delta * (lim.closed-lim.opened) > 0 else "opening")
             self.target[s] = destination if abs(delta) <= step + 1e-9 else lim.clamp(self.target[s] + max(-step,min(step,delta)))
         if opening and all(abs(self.target[s]-self.limits[s].opened)<1e-9 for s in SIDES):
             # Wait for the physical grippers too: an obstruction must not arm closing.

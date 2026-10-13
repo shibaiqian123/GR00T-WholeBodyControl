@@ -51,11 +51,26 @@ class StateTests(unittest.TestCase):
         for _ in range(40):r.tick(1)
         before=r.q['left'];r.tick();self.assertAlmostEqual(r.q['left'],before+.01)
         r.tick(1);self.assertAlmostEqual(r.q['left'],before)
-    def test_hysteresis(self):
-        r=Rig();r.ready();r.tick(.15);a=r.q['left'];r.tick(.12)
-        self.assertLess(r.q['left'],a);a=r.q['left'];r.tick(.10)
-        self.assertGreater(r.q['left'],a);a=r.q['left'];r.tick(.12)
-        self.assertGreater(r.q['left'],a)
+    def test_half_trigger_holds_half_position_indefinitely(self):
+        r=Rig();r.ready()
+        for _ in range(300):r.tick(.5,0)
+        self.assertAlmostEqual(r.q['left'],.5)
+        self.assertEqual(r.q['right'],1.)
+        self.assertEqual(r.c.motion['left'],'holding')
+
+    def test_deeper_and_shallower_trigger_follow_absolute_positions(self):
+        r=Rig();r.ready()
+        for trigger in [.25,.75,.5,1.,0.]:
+            for _ in range(110):r.tick(trigger,1-trigger)
+            self.assertAlmostEqual(r.q['left'],1-trigger)
+            self.assertAlmostEqual(r.q['right'],trigger)
+
+    def test_small_trigger_is_proportional_not_boolean(self):
+        r=Rig();r.ready()
+        for _ in range(100):r.tick(.05,.10)
+        self.assertAlmostEqual(r.q['left'],.95)
+        self.assertAlmostEqual(r.q['right'],.9)
+
     def test_reversed_endpoint_sign(self):
         r=Rig(True);r.ready();self.assertEqual(r.q['right'],0)
         r.tick(0,1);self.assertAlmostEqual(r.q['right'],.01)
