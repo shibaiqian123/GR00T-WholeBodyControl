@@ -1,0 +1,15 @@
+{
+  "calibrated": true,
+  "units": "motor_output_radians",
+  "left": {
+    "closed_rad": 0.0,
+    "open_rad": 5.35725,
+    "open_margin_rad": 0.05
+  },
+  "right": {
+    "closed_rad": 0.0,
+    "open_rad": 5.38774,
+    "open_margin_rad": 0.05
+  },
+  "notes": "Closed-zero calibration succeeded for IDs 0 and 1. Fully-open endpoints confirmed by operator after calibration; rounded to 5 decimal places above observed samples. No pre-calibration readings used. Opening command margin 0.05 rad added after recorded left full-open transient q=5.385349 exceeded calibrated q=5.35725 by 0.028099 rad. Calibrated feedback bounds are unchanged."
+}

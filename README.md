@@ -129,6 +129,15 @@ Download SONIC v1.1 and the planner:
 python download_from_hf.py --sonic-v1-1
 ```
 
+
+```bash
+cd /home/cqu023/GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env.sh
+```
+
+
+
+
 Run the default C++ deployment stack:
 
 ```bash
@@ -144,6 +153,7 @@ cd gear_sonic_deploy
     --cp policy/low_latency/model \
     --obs-config policy/low_latency/observation_config.yaml \
     --input-type zmq_manager \
+    --input-type keyboard \
     real
 ```
 
