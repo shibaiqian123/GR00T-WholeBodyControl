@@ -12,7 +12,7 @@ export LD_LIBRARY_PATH="/opt/onnxruntime/lib:/usr/local/cuda-12.1/lib64:/usr/lib
 RUN_ROOT="${VIBE_RUN_ROOT:-$HOME/sonic-diagnostics/groot-vibe-v1}"
 BUNDLE="${VIBE_BUNDLE:-$HOME/orcs-exports/stairs_split_v1/focus/split_sonic}"
 VISION="${VIBE_VISION:-$HOME/orcs-exports/stairs_split_v1/vision/theia-tiny.onnx}"
-CONFIG="${VIBE_OBS_CONFIG:-$RUN_ROOT/observation_config.json}"
+CONFIG="${VIBE_OBS_CONFIG:-$ROOT/gear_sonic_deploy/policy/vibe/observation_config_vibe_sonic.yaml}"
 LIBRARY="${VIBE_TRT_LIBRARY:-$HOME/sonic-diagnostics/vibe-deploy-build-v1/libvibe_trt.so}"
 OUT="${VIBE_OUT:-$RUN_ROOT/run_$(date +%Y%m%d_%H%M%S)_$$}"
 cd "$ROOT/gear_sonic_deploy"

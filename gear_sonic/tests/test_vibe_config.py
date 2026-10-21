@@ -50,6 +50,17 @@ class ConfigTests(unittest.TestCase):
     def test_missing_hash_entries(self):
         path=self.bundle/'bundle.json';b=json.loads(path.read_text());b['files'].pop('motion_encoder.onnx');self.write(path,b)
         with self.assertRaisesRegex(ValueError,'Incomplete'):self.config()
+    def test_yaml_and_relocated_models(self):
+        import yaml
+        relocated=self.root/'policy';relocated.mkdir()
+        for role,filename in (('motion_encoder','model_encoder'),('visual_decoder','model_decoder')):
+            (relocated/(filename+'.onnx')).write_bytes((self.bundle/(role+'.onnx')).read_bytes())
+        cfg=generate(self.bundle,self.vision,self.case,self.vibe,relocated)
+        p=self.root/'obs.yaml';p.write_text(yaml.safe_dump(cfg))
+        self.assertEqual(load(p),cfg)
+        self.assertEqual(cfg['model_paths']['visual_decoder'],str(relocated/'model_decoder.onnx'))
+        (relocated/'model_decoder.onnx').write_bytes(b'wrong')
+        with self.assertRaisesRegex(ValueError,'Relocated model'):load(p)
     def test_real_and_manager_rejected(self):
         script=Path(__file__).resolve().parents[1]/'scripts/run_vibe_sim.py'
         base=[sys.executable,str(script),'--policy-type','vibe','--bundle','x','--vision-encoder','x','--obs-config','x']

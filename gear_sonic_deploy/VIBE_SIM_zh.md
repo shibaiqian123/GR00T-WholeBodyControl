@@ -24,7 +24,7 @@ MuJoCo 窗口启动后暂停，空格开始/暂停；运行循环中 R 重置并
 
 `gear_sonic_deploy/deploy.sh` 仅在显式 `--policy-type vibe` 时转入新入口，`sim` 是唯一允许的目标。`--input-type zmq_manager` 明确拒绝，防止误把此入口当作实时遥操。SONIC 默认分支未改。
 
-观测配置是 JSON（也是 YAML 兼容格式），由 bundle、manifest 与 native case 自动生成。保持 930 维本体历史、840 维 tokenizer、64 维本体查询、6 维参考速度查询和 Theia patch/CLS 特征。根速度查询来自录制 reference，不使用实时机器人速度冒充目标速度。配置与模型、相机、动作参数、场景哈希不一致时拒绝运行。
+观测配置支持 JSON 和 YAML；当前默认使用 policy/vibe/observation_config_vibe_sonic.yaml，由 bundle、manifest 与 native case 自动生成。保持 930 维本体历史、840 维 tokenizer、64 维本体查询、6 维参考速度查询和 Theia patch/CLS 特征。根速度查询来自录制 reference，不使用实时机器人速度冒充目标速度。配置与模型、相机、动作参数、场景哈希不一致时拒绝运行。
 
 生成新版本配置（目标文件必须不存在）：
 
@@ -34,8 +34,8 @@ export VIBE_PYTHON=/home/cqu023/ViBe-SONIC/.venv/bin/python
 ./deploy.sh --policy-type vibe \
   --bundle /home/cqu023/orcs-exports/stairs_split_v1/focus/split_sonic \
   --vision-encoder /home/cqu023/orcs-exports/stairs_split_v1/vision/theia-tiny.onnx \
-  --obs-config /home/cqu023/sonic-diagnostics/groot-vibe-v1/observation_config.json \
-  --prepare-config \
+  --obs-config policy/vibe/observation_config_vibe_sonic.yaml \
+  --prepare-config --model-root policy/vibe \
   --case /home/cqu023/sonic-diagnostics/vibe-native-v1/case_stair_p2_6768415cac75882b \
   --vibe-root /home/cqu023/ViBe-SONIC/vibe sim
 ```
@@ -62,3 +62,11 @@ export VIBE_PYTHON=/home/cqu023/ViBe-SONIC/.venv/bin/python
 - 灰图控制循环实时倍率约 1.00，排除了模型加载和暂停；整次进程计时仍另行保留，不可混用。首轮正常图报告的 0.772 包含初始化，不能当作控制循环倍率。
 - 桌面已确认出现 `MuJoCo : mjlab scene` 和 `Actual Theia RGB - native MuJoCo` 窗口。初始暂停，尚未自动按键接管。
 - 7 项配置/入口测试通过。默认 SONIC 分支在新增 dispatch 区块之外保持原样；本轮没有重新启动原 SONIC 实机或遥操进程。
+
+## policy/vibe 模型位置
+
+当前默认配置：`gear_sonic_deploy/policy/vibe/observation_config_vibe_sonic.yaml`。
+新入口实际打开此目录中的 `model_encoder.onnx` 与 `model_decoder.onnx`，并核对它们与原 split bundle 的哈希；不是只修改显示路径。Theia 继续位于 `/home/cqu023/orcs-exports/stairs_split_v1/vision/theia-tiny.onnx`。不要删除原 bundle 的 manifest/校验来源。
+
+`policy_yaml_check/validation.json` 已确认上述实际加载路径、正常/灰图 latent 一致及 action 最大误差 5.0664e-7 / 4.1723e-7。配置搬迁测试后合计 8 项通过。
+此 YAML 不是原 SONIC 单输入 C++ 配置格式；不能省略 `--policy-type vibe` 并只使用 `--cp policy/vibe/model`。文件中的 `input_type: recorded_smpl` 如实表明当前入口，不能改成 zmq_manager 冒充已完成 PICO 接入。

@@ -14,7 +14,11 @@ def digest(path):
 
 
 def read(path):
-    return json.loads(Path(path).read_text())
+    text = Path(path).read_text()
+    if Path(path).suffix.lower() in ('.yaml', '.yml'):
+        import yaml
+        return yaml.safe_load(text)
+    return json.loads(text)
 
 
 def checked_files(root, files):
@@ -27,7 +31,7 @@ def checked_files(root, files):
             raise ValueError('Artifact hash mismatch: ' + str(path))
 
 
-def generate(bundle, vision, case, vibe_root):
+def generate(bundle, vision, case, vibe_root, model_root=None):
     bundle = Path(bundle).resolve()
     if bundle.is_dir():
         bundle /= 'bundle.json'
@@ -81,7 +85,7 @@ def generate(bundle, vision, case, vibe_root):
             'sim_timestep': .005, 'decimation': 4, 'step_dt': .02}:
         raise ValueError('Control clock mismatch')
     helper = vibe_root / 'src/vibe/sim2sim/runtime.py'
-    return {'schema': 'groot.vibe.recorded_sim.v1', 'simulation_only': True,
+    result = {'schema': 'groot.vibe.recorded_sim.v1', 'simulation_only': True,
             'input_type': 'recorded_smpl', 'bundle': str(bundle), 'vision_encoder': str(vision),
             'case': str(case), 'vibe_root': str(vibe_root), 'action': a,
             'inputs': d['inputs'], 'tokenizer': e['inputs'], 'control': d['control'],
@@ -96,10 +100,22 @@ def generate(bundle, vision, case, vibe_root):
                        'vision_manifest': digest(vision.with_suffix('.manifest.json')),
                        'case': digest(case / 'case.json'), 'native_helper': digest(helper)}}
 
+    if model_root is not None:
+        model_root = Path(model_root).resolve()
+        aliases = {'motion_encoder': 'model_encoder.onnx', 'visual_decoder': 'model_decoder.onnx'}
+        result['model_root'] = str(model_root)
+        result['model_paths'] = {}
+        for role, filename in aliases.items():
+            path = model_root / filename
+            if digest(path) != b['files'][role + '.onnx']:
+                raise ValueError('Relocated model does not match bundle: ' + str(path))
+            result['model_paths'][role] = str(path)
+    return result
+
 
 def load(path):
     cfg = read(path)
-    fresh = generate(cfg['bundle'], cfg['vision_encoder'], cfg['case'], cfg['vibe_root'])
+    fresh = generate(cfg['bundle'], cfg['vision_encoder'], cfg['case'], cfg['vibe_root'], cfg.get('model_root'))
     if cfg != fresh:
         raise ValueError('Observation config is stale or edited; regenerate and review it')
     return cfg

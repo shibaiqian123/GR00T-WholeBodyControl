@@ -28,6 +28,7 @@ def main():
     p.add_argument('--prepare-config', action='store_true')
     p.add_argument('--case')
     p.add_argument('--vibe-root')
+    p.add_argument('--model-root', help='Relocated model_encoder/model_decoder directory; hashes must match bundle')
     p.add_argument('--input-type', choices=['recorded_smpl'], default='recorded_smpl')
     p.add_argument('--backend', choices=['trt', 'ort'], default='trt')
     p.add_argument('--trt-library')
@@ -44,10 +45,15 @@ def main():
     if a.prepare_config:
         if not a.case or not a.vibe_root:
             p.error('--prepare-config requires --case and --vibe-root')
-        cfg = generate(a.bundle, a.vision_encoder, a.case, a.vibe_root)
+        cfg = generate(a.bundle, a.vision_encoder, a.case, a.vibe_root, a.model_root)
         dest = Path(a.obs_config); dest.parent.mkdir(parents=True, exist_ok=True)
         with dest.open('x') as f:
-            json.dump(cfg, f, indent=2)
+            if dest.suffix.lower() in ('.yaml', '.yml'):
+                import yaml
+                f.write('# ViBe recorded simulation contract; not the legacy SONIC C++ YAML format.\n# PICO/DDS integration is not enabled by this file.\n')
+                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+            else:
+                json.dump(cfg, f, indent=2)
         print('CONFIG_GENERATED (not a closed-loop validation):', dest)
         return
     if not a.out or a.steps < 1:
@@ -79,7 +85,10 @@ def main():
         bundle_dir = Path(cfg['bundle']).parent
         agent = SplitOnnxAgent(bundle_dir, provider='cpu')
         case = NativeCase(cfg['case'], agent.manifest)
-        paths = [bundle_dir/'motion_encoder.onnx', bundle_dir/'visual_decoder.onnx', Path(cfg['vision_encoder'])]
+        relocated = cfg.get('model_paths', {})
+        paths = [Path(relocated.get('motion_encoder', bundle_dir/'motion_encoder.onnx')),
+                 Path(relocated.get('visual_decoder', bundle_dir/'visual_decoder.onnx')), Path(cfg['vision_encoder'])]
+        report['loaded_model_paths'] = [str(x) for x in paths]
         opt = ort.SessionOptions(); opt.intra_op_num_threads=1; opt.inter_op_num_threads=1
         refs = [ort.InferenceSession(str(x),sess_options=opt,providers=['CPUExecutionProvider']) for x in paths]
         vm=json.loads(refs[2].get_modelmeta().custom_metadata_map['manifest'])
