@@ -28,6 +28,32 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Opt-in ViBe recorded simulation. Dispatch before original setup/interface discovery.
+# Original SONIC command line is untouched when --policy-type is absent.
+VIBE_POLICY=""
+VIBE_EXPECT_POLICY=0
+for VIBE_ARG in "$@"; do
+    if [[ "$VIBE_EXPECT_POLICY" == 1 ]]; then
+        VIBE_POLICY="$VIBE_ARG"
+        VIBE_EXPECT_POLICY=0
+    elif [[ "$VIBE_ARG" == "--policy-type" ]]; then
+        VIBE_EXPECT_POLICY=1
+    elif [[ "$VIBE_ARG" == --policy-type=* ]]; then
+        VIBE_POLICY="${VIBE_ARG#*=}"
+    fi
+done
+if [[ "$VIBE_EXPECT_POLICY" == 1 ]]; then
+    echo "--policy-type requires a value" >&2
+    exit 2
+fi
+if [[ -n "$VIBE_POLICY" ]]; then
+    if [[ "$VIBE_POLICY" != "vibe" ]]; then
+        echo "Unknown explicit --policy-type: $VIBE_POLICY" >&2
+        exit 2
+    fi
+    exec "${VIBE_PYTHON:-python}" "$SCRIPT_DIR/../gear_sonic/scripts/run_vibe_sim.py" "$@"
+fi
+
 # ============================================================================
 # Interface Resolution Functions
 # ============================================================================
