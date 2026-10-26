@@ -176,9 +176,6 @@ huggingface/
 *.ckpt
 *.safetensors
 *.engine
-!decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx
-!decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Walk.onnx
-!motionbricks/out/**/*.ckpt
 
 
 # Mujoco
@@ -222,3 +219,59 @@ sonic_release/
 
 # Independent simulation deployment environment
 .venv_vibe_deploy/
+
+# Local environments and secrets (keep shareable examples)
+.venv/
+.venv_*/
+venv/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Local recordings, backups and experiment outputs
+/bags/
+/dex1_backups/
+recordings/
+datasets/
+wandb/
+lightning_logs/
+tensorboard/
+runs/
+events.out.tfevents.*
+*.bag
+*.bag.active
+*.mcap
+
+# Additional model formats and exported inference artifacts
+*.onnx.data
+*.onnx_data
+*.tflite
+*.trt
+*.plan
+
+# Downloaded installers
+*.deb
+*.rpm
+*.AppImage
+
+# Generated native objects and CMake state
+# Do not blanket-ignore shared libraries: some vendor SDKs ship only binaries.
+*.o
+*.obj.d
+*.lo
+*.dSYM/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+cmake-build-*/
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# Editor scratch files and OS metadata
+*.swp
+*.swo
+*~
+Thumbs.db
