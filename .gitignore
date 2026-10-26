@@ -232,7 +232,6 @@ venv/
 
 # Local recordings, backups and experiment outputs
 /bags/
-/dex1_backups/
 recordings/
 datasets/
 wandb/
@@ -275,3 +274,21 @@ compile_commands.json
 *.swo
 *~
 Thumbs.db
+
+# Local video recordings and demonstration videos
+*.[mM][pP]4
+*.[aA][vV][iI]
+*.[mM][oO][vV]
+*.[mM][kK][vV]
+*.[wW][eE][bB][mM]
+*.m4v
+*.mpeg
+*.mpg
+
+# Recorded dataset containers (keep repository test fixtures)
+*.hdf5
+*.h5
+*.parquet
+!decoupled_wbc/tests/**/*.hdf5
+!decoupled_wbc/tests/**/*.h5
+!decoupled_wbc/tests/**/*.parquet
