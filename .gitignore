@@ -219,3 +219,6 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+
+# Independent simulation deployment environment
+.venv_vibe_deploy/

@@ -4,6 +4,25 @@ Parses a YAML-based WBC config via tyro CLI, instantiates the G1 robot model,
 and launches the simulator (optionally with offscreen image publishing).
 """
 
+# Optional training-asset simulation; default SONIC path below is unchanged.
+# Keep this dispatch ahead of tyro and preserve run_sim_realtime.py's loop patch.
+if __name__ == "__main__":
+    import os, sys
+    from pathlib import Path
+    if "--vibe-config" in sys.argv or any(x.startswith("--vibe-config=") for x in sys.argv):
+        args=[]
+        for item in sys.argv[1:]:
+            if item=="--vibe-config": item="--config"
+            elif item.startswith("--vibe-config="): item="--config="+item.split("=",1)[1]
+            args.append(item)
+        root=Path(__file__).resolve().parents[2]
+        python=os.environ.get("VIBE_DEPLOY_PYTHON",str(root/".venv_vibe_deploy/bin/python"))
+        env=os.environ.copy()
+        env["PYTHONPATH"]=str(root)
+        env["PYTHONNOUSERSITE"]="1"
+        print("VIBE_SIM: training Dex1, original SONIC elastic band; simulation interpreter="+python,flush=True)
+        os.execve(python,[python,str(root/"gear_sonic/scripts/run_vibe_hybrid_sim.py"),*args],env)
+
 from typing import Dict
 
 import tyro

@@ -31,7 +31,7 @@ def checked_files(root, files):
             raise ValueError('Artifact hash mismatch: ' + str(path))
 
 
-def generate(bundle, vision, case, vibe_root, model_root=None):
+def generate(bundle, vision, case, vibe_root, model_root=None, standalone=False):
     bundle = Path(bundle).resolve()
     if bundle.is_dir():
         bundle /= 'bundle.json'
@@ -84,7 +84,7 @@ def generate(bundle, vision, case, vibe_root, model_root=None):
     if c['physics_dt'] != .005 or c['control_dt'] != .02 or d['control'] != {
             'sim_timestep': .005, 'decimation': 4, 'step_dt': .02}:
         raise ValueError('Control clock mismatch')
-    helper = vibe_root / 'src/vibe/sim2sim/runtime.py'
+    helper = (Path(__file__).parent / 'standalone/native.py') if standalone else vibe_root / 'src/vibe/sim2sim/runtime.py'
     result = {'schema': 'groot.vibe.recorded_sim.v1', 'simulation_only': True,
             'input_type': 'recorded_smpl', 'bundle': str(bundle), 'vision_encoder': str(vision),
             'case': str(case), 'vibe_root': str(vibe_root), 'action': a,
@@ -110,12 +110,23 @@ def generate(bundle, vision, case, vibe_root, model_root=None):
             if digest(path) != b['files'][role + '.onnx']:
                 raise ValueError('Relocated model does not match bundle: ' + str(path))
             result['model_paths'][role] = str(path)
+    if standalone:
+        result['schema']='groot.vibe.standalone.v1'
+        result.pop('vibe_root')
     return result
 
 
 def load(path):
     cfg = read(path)
-    fresh = generate(cfg['bundle'], cfg['vision_encoder'], cfg['case'], cfg['vibe_root'], cfg.get('model_root'))
+    independent=cfg['schema']=='groot.vibe.standalone.v1'
+    fresh = generate(cfg['bundle'], cfg['vision_encoder'], cfg['case'], cfg.get('vibe_root','.'), cfg.get('model_root'),standalone=independent)
+    if independent:
+        derived=Path(cfg['vision_trt'])
+        report=read(derived.with_suffix('.adaptation.json'))
+        if report['status']!='passed' or report['source_sha256']!=digest(cfg['vision_encoder']) or report['derived_sha256']!=digest(derived):
+            raise ValueError('Prepared TensorRT vision artifact mismatch')
+        fresh['vision_trt']=str(derived)
+        fresh['vision_trt_sha256']=digest(derived)
     if cfg != fresh:
         raise ValueError('Observation config is stale or edited; regenerate and review it')
     return cfg

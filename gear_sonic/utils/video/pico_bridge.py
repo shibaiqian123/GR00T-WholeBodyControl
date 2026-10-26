@@ -252,7 +252,7 @@ class VideoSession:
             for attempt in range(10):
                 if self.stop_event.is_set():return
                 try:
-                    self.sock=socket.create_connection((self.request.ip,self.request.port),timeout=.5);break
+                    self.sock=socket.create_connection((self.request.ip,self.request.port),timeout=.5, source_address=(getattr(self.source, "video_bind_host", ""), 0));break
                 except OSError:
                     if attempt==9:raise
                     self.stop_event.wait(.3)

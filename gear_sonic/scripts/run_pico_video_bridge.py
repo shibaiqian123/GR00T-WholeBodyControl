@@ -9,9 +9,9 @@ from gear_sonic.utils.video.pico_bridge import Bridge,CameraSource,EventLog
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--interface',default='enx6c1ff7b8d821')
-    p.add_argument('--listen-host',default='192.168.1.103')
+    p.add_argument('--listen-host',default='192.168.11.224')
     p.add_argument('--listen-port',type=int,default=13579)
-    p.add_argument('--headset',default='192.168.1.199')
+    p.add_argument('--headset',default='192.168.11.228')
     p.add_argument('--source',choices=['robot','test'],default='robot')
     p.add_argument('--source-fps',type=int,default=10)
     p.add_argument('--max-bitrate',type=int,default=4000000)

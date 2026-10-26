@@ -42,11 +42,13 @@ class DdsGrippers:
     def snapshot(self):
         with self.lock:return dict(self.measured)
     def write(self, targets):
+        self.last_writes = {}
         for side,q in targets.items():
             if side in self.publishers:
                 motor=self.motor_type(mode=1,q=float(q),dq=0.,tau=0.,kp=self.kp,kd=self.kd,reserve=[0,0,0])
                 if self.publishers[side].Write(self.command_type(cmds=[motor]),timeout=.01) is False:
                     raise RuntimeError(f'{side} DDS write failed; cannot guarantee holding')
+                self.last_writes[side] = (float(q), time.monotonic())
     def close(self):
         for channel in self.subscribers+list(self.publishers.values()):channel.Close()
 
@@ -114,15 +116,19 @@ def main():
     p.add_argument('--domain',type=int,default=0)
     p.add_argument('--limits',type=Path,help='JSON with confirmed calibrated endpoints, radians')
     p.add_argument('--startup-open-time','--travel-time',dest='travel_time',type=float,default=2.,help='Startup opening time only; normal trigger tracking is direct, without slew limiting')
+    p.add_argument('--obstruction-hold',action='store_true',help='Opt-in per-hand blocked-closing hold; release trigger to captured aperture to resume')
+    p.add_argument('--obstruction-timeout',type=float,default=1.,help='Continuous blocked-closing duration in seconds (default: 1)')
     p.add_argument('--feedback-timeout',type=float,default=.25)
     p.add_argument('--trigger-port',type=int,default=5556)
     p.add_argument('--status-port',type=int,default=5557)
+    p.add_argument('--telemetry-port',type=int,default=0,help='Optional local Dex1 recording PUB port; 0 disables')
     p.add_argument('--kp',type=float,default=5.)
     p.add_argument('--kd',type=float,default=.05)
     p.add_argument('--observe',action='store_true',help='Read-only Dex1 feedback for ten seconds; no endpoint file required')
     p.add_argument('--execute',action='store_true',help='Enable real DDS motor commands; otherwise receive-only dry-run')
     p.add_argument('--demo',action='store_true',help='Offline demonstration with virtual feedback; no DDS/ZMQ')
     a=p.parse_args()
+    if a.telemetry_port and not 1024 <= a.telemetry_port <= 65535:p.error('Invalid telemetry port')
     if a.observe and (a.execute or a.demo):p.error("--observe cannot be combined with --execute or --demo")
     if a.demo:
         if a.execute:p.error('--demo cannot be combined with --execute')
@@ -139,7 +145,8 @@ def main():
                 print(json.dumps(dds.snapshot()),flush=True);time.sleep(1)
         finally:dds.close()
         return
-    try:c=RampController(read_limits(a.limits),a.travel_time,a.feedback_timeout)
+    try:c=RampController(read_limits(a.limits),a.travel_time,a.feedback_timeout,
+                         obstruction_hold=a.obstruction_hold,obstruction_timeout=a.obstruction_timeout)
     except (ValueError,TypeError,KeyError,OSError) as exc:p.error(str(exc))
     import zmq
     context=zmq.Context();sockets=[]
@@ -149,9 +156,13 @@ def main():
     triggers=PacketReader(sockets[0],b'dex1_trigger ',True)
     status=PacketReader(sockets[1],b'dex1_control_status ')
     dds=None
+    telemetry=None
     print('EXECUTE: motor commands enabled' if a.execute else 'DRY-RUN: no DDS command publishers are created',flush=True)
     print('R + Enter: resume a latched hold, only with fresh data and both triggers released. Q + Enter: exit (holding ceases).',flush=True)
     try:
+        if a.telemetry_port:
+            from gear_sonic.utils.teleop.dex1_recording import Publisher
+            telemetry=Publisher(a.telemetry_port)
         dds=DdsGrippers(a.interface,a.domain,a.execute,a.kp,a.kd)
         last_report=-math.inf;deadline=time.monotonic();previous=None
         while True:
@@ -163,23 +174,30 @@ def main():
             tr=triggers.poll();hb=status.poll();measured=dds.snapshot()
             now=time.monotonic()
             targets=c.update(now,measured,tr,hb,resume)
-            dds.write(targets)
-            if now-last_report>=1 or previous!=c.phase:
+            try:
+                dds.write(targets)
+            finally:
+                if telemetry:
+                    telemetry.publish(measured,tr,dds.last_writes,c)
+            report_state=(c.phase, tuple(v['state'] for v in c.obstruction_status.values()) if c.obstruction_status else ())
+            if now-last_report>=1 or previous!=report_state:
                 print(json.dumps({'mode':'execute' if a.execute else 'dry-run','state':c.phase,'reason':c.reason,
                     'input_errors':[triggers.last_error,status.last_error],
+                    'obstruction_status':c.obstruction_status,
                     'feedback_status':c.feedback_status,'first_fault':c.first_fault,
                     'trigger':{s:tr.get(s) for s in SIDES} if tr else None,
                     'measured':{s:v[0] for s,v in measured.items()},'target':targets,
                     'requested_target':c.requested if c.phase=='READY' else None,
                     'endpoint_braking':c.endpoint_braking if c.phase=='READY' else None,
                     'direction':c.motion if c.phase=='READY' else None}),flush=True)
-                previous=c.phase;last_report=now
+                previous=report_state;last_report=now
             deadline+=.02
             if now-deadline>.04:deadline=now
             time.sleep(max(0.,deadline-time.monotonic()))
     except KeyboardInterrupt:
         print('Exiting: position holding cannot continue after this process closes.')
     finally:
+        if telemetry:telemetry.close()
         if dds:dds.close()
         for sock in sockets:sock.close()
         context.term()

@@ -23,6 +23,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import json
+from pathlib import Path
 import time
 
 import numpy as np
@@ -71,6 +72,11 @@ class SonicDataExporterConfig:
     data_collection_frequency: int = 50
     """Data collection frequency (Hz)."""
 
+
+    record_dex1: bool = False
+    dex1_telemetry_port: int = 5559
+    dex1_max_age: float = 0.1
+    dex1_limits: str = "gear_sonic/configs/dex1_limits.g1_20261013.json"
 
     # Camera
     camera_host: str = "localhost"
@@ -227,12 +233,20 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        dex1_port: int = 0,
+        dex1_max_age: float = 0.1,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self._dex1 = None
+        self._dex1_counts = {"frames": 0, "feedback": [0,0], "command": [0,0], "trigger": [0,0]}
+        self._dex1_last_warning = -float("inf")
+        if dex1_port:
+            from gear_sonic.utils.teleop.dex1_recording import Subscriber
+            self._dex1 = Subscriber(dex1_port, dex1_max_age)
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -329,6 +343,7 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
+                self._dex1_report()
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
@@ -545,6 +560,7 @@ class GrootDataCollector:
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                self._dex1_report()
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
@@ -571,10 +587,28 @@ class GrootDataCollector:
 
         return self._add_data_frame_sonic(t_start)
 
+    def _dex1_report(self):
+        if self._dex1 and self._dex1_counts["frames"]:
+            report = {"episode_index": int(self.current_episode_index), **self._dex1_counts}
+            path = self.data_exporter.meta.root / "meta/dex1_quality.jsonl"
+            with path.open("a") as f:
+                f.write(json.dumps(report) + "\n")
+            print("[Dex1] Episode invalid-frame counts:", report)
+            self._dex1_counts = {"frames": 0, "feedback": [0,0], "command": [0,0], "trigger": [0,0]}
+
     def _add_data_frame_sonic(self, t_start: float) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
         assert self.latest_proprio_msg is not None
         proprio = self.latest_proprio_msg
+        dex1_frame = {}
+        if self._dex1:
+            dex1_frame = self._dex1.frame(t_start)
+            ready = all(dex1_frame["dex1."+k+"_valid"].all() for k in ("feedback","command"))
+            if not ready and not self.data_exporter.episode_buffer.get("size",0):
+                if t_start-self._dex1_last_warning >= 1:
+                    print("[Dex1] Waiting for fresh bilateral feedback and published targets before first frame")
+                    self._dex1_last_warning=t_start
+                return False
 
         whole_q = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["body_q"],
@@ -612,7 +646,16 @@ class GrootDataCollector:
 
         self._log_latency_periodic(sonic_latency_ms)
 
+        frame_data.update(dex1_frame)
         self.data_exporter.add_frame(frame_data)
+        if self._dex1:
+            self._dex1_counts["frames"] += 1
+            for kind in ("feedback","command","trigger"):
+                for i in range(2):
+                    self._dex1_counts[kind][i] += int(not dex1_frame["dex1."+kind+"_valid"][i])
+            if not all(dex1_frame["dex1."+k+"_valid"].all() for k in ("feedback","command","trigger")) and t_start-self._dex1_last_warning >= 1:
+                print("[Dex1] Invalid/stale samples recorded with masks; do not train on these windows")
+                self._dex1_last_warning=t_start
         return self._finalize_frame(t_start)
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
@@ -833,6 +876,7 @@ class GrootDataCollector:
             self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                self._dex1_report()
                 self.data_exporter.save_episode()
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
@@ -841,9 +885,15 @@ class GrootDataCollector:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
         try:
+            self._image_subscriber.close()
+        except Exception:
+            pass
+        try:
             self._state_subscriber.close()
         except Exception:
             pass
+        if self._dex1:
+            self._dex1.close()
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -864,6 +914,8 @@ class GrootDataCollector:
             while True:
                 t_start = time.monotonic()
                 with self.telemetry.timer("total_loop"):
+                    if self._dex1:
+                        self._dex1.poll()
                     with self.telemetry.timer("poll_state"):
                         self._poll_state_zmq()
 
@@ -872,8 +924,11 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
+                        self.latest_image_msg = img_msg
                         if img_msg is not None:
-                            self.latest_image_msg = img_msg
+                            stamps = img_msg.get("timestamps", {})
+                            if not stamps or any(time.time() - stamp > .5 for stamp in stamps.values()):
+                                self.latest_image_msg = None
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -897,6 +952,7 @@ class GrootDataCollector:
             print("Data exporter terminated by user")
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                self._dex1_report()
                 self.data_exporter.save_episode_as_discarded()
 
         finally:
@@ -911,8 +967,21 @@ class GrootDataCollector:
 def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
+    dex1_meta = None
+    if config.record_dex1:
+        from gear_sonic.utils.teleop.dex1_recording import check_dataset, metadata
+        from gear_sonic.scripts.run_dex1_trigger_control import read_limits
+        read_limits(Path(config.dex1_limits))
+        if not np.isfinite(config.dex1_max_age) or config.dex1_max_age <= 0:
+            raise ValueError("dex1-max-age must be positive and finite")
+        calibration = json.loads(Path(config.dex1_limits).read_text())
+        check_dataset(Path(config.root_output_dir)/config.dataset_name, calibration, config.dex1_max_age)
+        dex1_meta = metadata(calibration, config.dex1_max_age)
     dataset_features = get_features_sonic_vla(g1_rm)
     modality_config = get_modality_config_sonic_vla(g1_rm)
+    if config.record_dex1:
+        from gear_sonic.data.features_sonic_vla import add_dex1_recording_features
+        add_dex1_recording_features(dataset_features, modality_config)
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -923,6 +992,11 @@ def main(config: SonicDataExporterConfig):
                 modality_config[key].update(value)
             else:
                 modality_config[key] = value
+
+    if config.record_dex1:
+        check_dataset(Path(config.root_output_dir)/config.dataset_name, calibration,
+                      config.dex1_max_age, dataset_features, modality_config,
+                      config.data_collection_frequency)
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
@@ -936,7 +1010,8 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras,
+                       **({"dex1_recording": dex1_meta} if dex1_meta else {})},
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1025,8 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        dex1_port=config.dex1_telemetry_port if config.record_dex1 else 0,
+        dex1_max_age=config.dex1_max_age,
     )
     data_collector.run()
 

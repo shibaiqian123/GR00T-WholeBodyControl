@@ -1,6 +1,10 @@
 """
 All-in-one tmux launcher for SONIC data collection.
 
+Real robot mode splits one tmux window into five panes: deploy, PICO, Dex1,
+USB right-eye video, and exporter. Use --dry-run to inspect commands without launching.
+The four-pane layout below applies to the legacy --sim path.
+
 Starts the full data collection stack in a single tmux session:
 
     Window 0 — data_collection (4 panes):
@@ -36,6 +40,9 @@ Usage (from repo root — no venv activation needed):
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shlex
+import json
+import math
 import shutil
 import signal
 import socket
@@ -85,6 +92,26 @@ def _get_local_ip() -> str:
 @dataclass
 class DataCollectionLaunchConfig:
     """CLI config for the all-in-one data collection tmux launcher."""
+
+    # Real robot five-terminal preset.
+    root_output_dir: str = "outputs"
+    """Output root forwarded to the data exporter."""
+    interface: str = "enx6c1ff7b8d821"
+    """Robot Ethernet interface for deployment and Dex1."""
+    listen_host: str = "192.168.11.224"
+    """Workstation LAN IP used by PICO."""
+    headset: str = "192.168.11.228"
+    """PICO LAN IP."""
+    usb_camera_port: int = 15556
+    """Robot USB camera TCP port (not the exporter ZMQ port)."""
+    dex1_limits: str = "gear_sonic/configs/dex1_limits.g1_20261013.json"
+    """Calibrated soft limits file."""
+    dex1_telemetry_port: int = 5559
+    """Local continuous Dex1 recording stream (real robot preset)."""
+    obstruction_timeout: float = 1.0
+    """Seconds of blocked closing before per-hand hold."""
+    dry_run: bool = False
+    """Print terminal commands without starting processes."""
 
     # Deployment mode
     sim: bool = False
@@ -155,11 +182,11 @@ class DataCollectionLaunchConfig:
     camera_viewer: bool = True
     """Start the camera viewer pane."""
 
-    camera_host: str = "localhost"
-    """Camera server host (shared by data exporter and viewer)."""
+    camera_host: str = "192.168.123.164"
+    """Real mode: robot USB camera host. Sim mode: simulator camera host."""
 
     camera_port: int = 5555
-    """Camera server port (shared by data exporter and viewer)."""
+    """Local recording ZMQ port; real USB port is --usb-camera-port."""
 
 
 SESSION_NAME = "sonic_data_collection"
@@ -285,7 +312,7 @@ def _check_pane_alive(pane_index: int) -> bool:
     return result.stdout.strip() != "1"
 
 
-def main(config: DataCollectionLaunchConfig):
+def legacy_main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
     _check_prerequisites(config)
@@ -468,6 +495,186 @@ def main(config: DataCollectionLaunchConfig):
         print(f"  Kill:      tmux kill-session -t {SESSION_NAME}")
 
 
+
+def build_real_commands(config, repo_root):
+    """Pure command construction, shared by dry-run and launch."""
+    q = shlex.quote
+    def python_command(venv, args):
+        return (f"cd {q(str(repo_root))} && source {q(venv + '/bin/activate')} && "
+                + "exec " + shlex.join(["python", *args]))
+
+    deploy = ["./deploy.sh", "--cp", config.deploy_checkpoint or "policy/release/model",
+              "--obs-config", config.deploy_obs_config or "policy/release/observation_config.yaml",
+              "--input-type", config.deploy_input_type, "--zmq-host", config.deploy_zmq_host,
+              "--enable-dex1-heartbeat"]
+    for flag, value in [
+        ("--planner", config.deploy_planner), ("--motion-data", config.deploy_motion_data),
+        ("--output-type", config.deploy_output_type),
+        ("--motor-kp-scale", config.deploy_motor_kp_scale),
+        ("--motor-kd-scale", config.deploy_motor_kd_scale),
+    ]:
+        if value:
+            deploy.extend([flag, value])
+    deploy.append(config.interface)
+    teleop = ["gear_sonic/scripts/pico_manager_thread_server.py",
+              "--input-source", config.pico_input_source, "--manager", "--port", "5556",
+              "--dex1-triggers"]
+    for enabled, flag in [(config.pico_vis_vr3pt, "--vis_vr3pt"),
+                          (config.pico_vis_smpl, "--vis_smpl"),
+                          (config.pico_waist_tracking, "--waist_tracking")]:
+        if enabled:
+            teleop.append(flag)
+    gripper = ["-m", "gear_sonic.scripts.run_dex1_trigger_control",
+               "--interface", config.interface, "--limits", config.dex1_limits,
+               "--travel-time", "2", "--obstruction-hold", "--obstruction-timeout",
+               str(config.obstruction_timeout), "--execute",
+               "--telemetry-port", str(config.dex1_telemetry_port)]
+    video = ["-m", "gear_sonic.scripts.run_pico_usb_stereo",
+             "--camera-host", config.camera_host, "--camera-port", str(config.usb_camera_port),
+             "--listen-host", config.listen_host, "--headset", config.headset,
+             "--view", "right", "--publish-camera-port", str(config.camera_port)]
+    if config.camera_viewer:
+        video.append("--preview")
+    exporter = ["gear_sonic/scripts/run_data_exporter.py",
+                "--camera-host", "127.0.0.1", "--camera-port", str(config.camera_port),
+                "--task-prompt", config.task_prompt, "--root-output-dir", config.root_output_dir,
+                "--data-collection-frequency", str(config.data_exporter_frequency),
+                "--record-dex1", "--dex1-telemetry-port", str(config.dex1_telemetry_port),
+                "--dex1-limits", config.dex1_limits]
+    if config.dataset_name:
+        exporter.extend(["--dataset-name", config.dataset_name])
+    if not config.text_to_speech:
+        exporter.append("--no-text-to-speech")
+    return [
+        ("1-deploy", f"cd {q(str(repo_root / 'gear_sonic_deploy'))} && exec {shlex.join(deploy)}"),
+        ("2-pico", python_command(".venv_teleop", teleop)),
+        ("3-dex1", python_command(".venv_teleop", gripper)),
+        ("4-video", python_command(".venv_teleop", video)),
+        ("5-exporter", python_command(".venv_data_collection", exporter)),
+    ]
+
+
+def check_listen_address(host, port):
+    """Match server reuse semantics while still rejecting an active listener."""
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+            sock.listen(1)
+        except OSError as exc:
+            raise ValueError(f"Cannot use {host}:{port}: {exc}. Nothing was launched.") from exc
+
+
+def check_real_launch(config, repo_root):
+    if config.record_wrist_cameras:
+        raise ValueError("The USB right-eye publisher has no wrist streams yet.")
+    if not config.pico_manager or config.pico_input_source != "xrt":
+        raise ValueError("The real five-terminal preset requires PICO xrt manager mode.")
+    if not math.isfinite(config.obstruction_timeout) or config.obstruction_timeout <= 0:
+        raise ValueError("obstruction-timeout must be positive and finite")
+    for port in (config.camera_port, config.usb_camera_port):
+        if not 1024 <= port <= 65535:
+            raise ValueError("Camera ports must be in 1024..65535")
+    if config.camera_port in (5556, 5557, 13579):
+        raise ValueError("Recording port conflicts with a control/video port")
+    from gear_sonic.utils.teleop.dex1_recording import check_dataset
+    from gear_sonic.scripts.run_dex1_trigger_control import read_limits
+    read_limits(repo_root / config.dex1_limits)
+    if not 1024 <= config.dex1_telemetry_port <= 65535 or config.dex1_telemetry_port in (5556,5557,5558,13579,config.camera_port,config.usb_camera_port):
+        raise ValueError("Invalid/conflicting Dex1 telemetry port")
+    if config.dataset_name:
+        dataset_root = repo_root / config.root_output_dir / config.dataset_name
+        calibration = json.loads((repo_root / config.dex1_limits).read_text())
+        check_dataset(dataset_root, calibration, fps=config.data_exporter_frequency)
+        if dataset_root.exists():
+            from gear_sonic.data.features_sonic_vla import (get_g1_robot_model,
+                get_features_sonic_vla, get_modality_config_sonic_vla, add_dex1_recording_features)
+            model = get_g1_robot_model()
+            expected_features = get_features_sonic_vla(model)
+            expected_modalities = get_modality_config_sonic_vla(model)
+            add_dex1_recording_features(expected_features, expected_modalities)
+            check_dataset(dataset_root, calibration, expected_features=expected_features,
+                          expected_modalities=expected_modalities, fps=config.data_exporter_frequency)
+    if config.dry_run:
+        return
+    if subprocess.run(["tmux", "has-session", "-t", SESSION_NAME], capture_output=True).returncode == 0:
+        raise ValueError(f"Session already exists. Reattach with: tmux attach -t {SESSION_NAME}")
+    if not Path("/sys/class/net", config.interface).exists():
+        raise ValueError(f"Robot interface does not exist: {config.interface}")
+    from gear_sonic.scripts.run_dex1_trigger_control import read_limits
+    read_limits(repo_root / config.dex1_limits)
+    conflicts = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            args = (proc / "cmdline").read_bytes().decode(errors="replace").split(chr(0))
+            if any(Path(a).name in {"g1_deploy_onnx_ref", "pico_manager_thread_server.py",
+                                   "run_data_exporter.py", "run_dex1_trigger_control.py",
+                                   "run_pico_usb_stereo.py"}
+                   or a in {"gear_sonic.scripts.run_dex1_trigger_control",
+                            "gear_sonic.scripts.run_pico_usb_stereo"} for a in args):
+                conflicts.append(proc.name)
+        except (OSError, PermissionError):
+            pass
+    if conflicts:
+        raise ValueError("Stack processes already running (PIDs " + ", ".join(conflicts)
+                         + "). Stop the old stack in its terminals before launching; nothing was killed.")
+    for host, port in [("127.0.0.1", config.camera_port), ("0.0.0.0", 5556),
+                       ("0.0.0.0", 5557), ("127.0.0.1", config.dex1_telemetry_port), (config.listen_host, 13579)]:
+        check_listen_address(host, port)
+
+
+def create_five_panes(commands, tmux_prefix=("tmux",), session_name=SESSION_NAME):
+    """Left column: deploy/PICO/Dex1; right column: video/exporter."""
+    def run(*args, capture=False):
+        return subprocess.run([*tmux_prefix, *args], check=True,
+                              capture_output=capture, text=True)
+    first = run("new-session", "-d", "-s", session_name, "-n", "data_collection",
+                "-x", "180", "-y", "48", "-P", "-F", "#{pane_id}", capture=True).stdout.strip()
+    window = f"{session_name}:data_collection"
+    run("set-option", "-t", session_name, "mouse", "on")
+    run("set-option", "-w", "-t", window, "remain-on-exit", "on")
+    run("set-option", "-w", "-t", window, "pane-border-status", "top")
+    run("set-option", "-w", "-t", window, "pane-border-format", " #{pane_title} ")
+    def split(target, direction, percent):
+        return run("split-window", "-d", "-t", target, direction, "-p", str(percent),
+                   "-P", "-F", "#{pane_id}", capture=True).stdout.strip()
+    video = split(first, "-h", 50)
+    pico = split(first, "-v", 66)
+    dex1 = split(pico, "-v", 50)
+    exporter = split(video, "-v", 50)
+    panes = [first, pico, dex1, video, exporter]
+    # Build the entire layout before starting any component.
+    for pane, (name, command) in zip(panes, commands):
+        run("select-pane", "-t", pane, "-T", name)
+        run("respawn-pane", "-k", "-t", pane, shlex.join(["bash", "-c", command]))
+    run("select-pane", "-t", first)
+    return panes
+
+
+def main(config):
+    if config.sim:
+        if config.dry_run:
+            raise ValueError("--dry-run is currently supported for the real five-terminal preset only")
+        return legacy_main(config)
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    if not config.dry_run:
+        _check_prerequisites(config)
+    check_real_launch(config, repo_root)
+    commands = build_real_commands(config, repo_root)
+    for name, command in commands:
+        print(f"[{name}]", command, sep=chr(10), flush=True)
+    if config.dry_run:
+        return
+    create_five_panes(commands)
+    print("Five panes created in one tmux window. Click a pane or use Ctrl+b then arrows.")
+    print("Deployment retains its original confirmation prompt in the top-left pane.")
+    print(f"PICO Listen: {config.listen_host}; recording: 127.0.0.1:{config.camera_port}")
+    print(f"Detach: Ctrl+b then d. Reattach: tmux attach -t {SESSION_NAME}")
+    subprocess.run(["tmux", "attach", "-t", SESSION_NAME])
+
+
 def _signal_handler(sig, frame):
     print("\nShutdown requested...")
     subprocess.run(
@@ -478,6 +685,7 @@ def _signal_handler(sig, frame):
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, _signal_handler)
     config = tyro.cli(DataCollectionLaunchConfig)
+    if config.sim:
+        signal.signal(signal.SIGINT, _signal_handler)
     main(config)

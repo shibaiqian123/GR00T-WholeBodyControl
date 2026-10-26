@@ -47,6 +47,9 @@ if [[ "$VIBE_EXPECT_POLICY" == 1 ]]; then
     exit 2
 fi
 if [[ -n "$VIBE_POLICY" ]]; then
+    if [[ "$VIBE_POLICY" == "vibe-hybrid" ]]; then
+        exec "${VIBE_DEPLOY_PYTHON:-$SCRIPT_DIR/../.venv_vibe_deploy/bin/python}" "$SCRIPT_DIR/../gear_sonic/scripts/run_vibe_hybrid.py" "$@"
+    fi
     if [[ "$VIBE_POLICY" != "vibe" ]]; then
         echo "Unknown explicit --policy-type: $VIBE_POLICY" >&2
         exit 2

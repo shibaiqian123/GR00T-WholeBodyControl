@@ -62,12 +62,62 @@ def endpoint_braked_target(limit, previous, requested, measured_q, measured_dq, 
     if low:shaped=1-shaped
     return limit.clamp(limit.closed+shaped*span), True
 
+class ObstructionHold:
+    """Position-based contact heuristic; not a motor fault or torque limiter."""
+    def __init__(self, duration=1.0, error=.15, speed=.05, travel=.02):
+        if not all(math.isfinite(x) and x > 0 for x in (duration, error, speed, travel)):
+            raise ValueError('Obstruction thresholds must be positive finite numbers')
+        self.duration, self.error, self.speed, self.travel = duration, error, speed, travel
+        self.reset()
+
+    def reset(self):
+        self.start = self.anchor = self.last_time = self.last_rx = None
+        self.hold_q = self.release_trigger = None
+        self.status = {'state': 'idle', 'elapsed': 0.0}
+
+    def update(self, limit, now, feedback, trigger, target):
+        q, rx = feedback[:2]
+        sign = math.copysign(1., limit.closed-limit.command_open)
+        if self.hold_q is not None:
+            if trigger > self.release_trigger + 1e-9:
+                self.status = {'state': 'holding', 'hold_q': self.hold_q,
+                               'release_trigger': self.release_trigger}
+                return self.hold_q
+            self.reset()
+            self.status = {'state': 'released', 'elapsed': 0.0}
+            return target
+        # Require new feedback at each counted step and no scheduling gap >100 ms.
+        continuous = (self.last_time is not None and 0 < now-self.last_time <= .1
+                      and self.last_rx is not None and rx > self.last_rx)
+        self.last_time, self.last_rx = now, rx
+        dq = feedback[2] if len(feedback) >= 3 else math.inf
+        requested = limit.command_open + trigger*(limit.closed-limit.command_open)
+        blocked = ((target-q)*sign >= self.error and (requested-q)*sign >= self.error
+                   and abs(dq) <= self.speed)
+        if not blocked:
+            self.start = self.anchor = None
+        elif not continuous or self.start is None or abs(q-self.anchor) > self.travel:
+            self.start, self.anchor = now, q
+        elapsed = 0. if self.start is None else now-self.start
+        self.status = {'state': 'candidate' if blocked else 'idle', 'elapsed': elapsed}
+        if blocked and elapsed + 1e-9 >= self.duration:
+            self.hold_q = limit.clamp(q)
+            self.release_trigger = max(0., min(1., (self.hold_q-limit.command_open) /
+                                                     (limit.closed-limit.command_open)))
+            self.status = {'state': 'holding', 'hold_q': self.hold_q,
+                           'release_trigger': self.release_trigger}
+            return self.hold_q
+        return target
+
 class RampController:
-    def __init__(self, limits, travel_time=2.0, timeout=.25):
+    def __init__(self, limits, travel_time=2.0, timeout=.25, *, obstruction_hold=False,
+                 obstruction_timeout=1.0):
         if set(limits) != set(SIDES):
             raise ValueError('Both left and right limits are required')
         if not math.isfinite(travel_time) or travel_time <= 0 or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('Travel time and timeout must be positive finite numbers')
+        self.obstruction_enabled = obstruction_hold
+        self.obstruction = {s: ObstructionHold(obstruction_timeout) for s in SIDES}
         self.limits = limits
         self.travel_time = travel_time
         self.timeout = timeout
@@ -81,6 +131,10 @@ class RampController:
         self.endpoint_braking = dict.fromkeys(SIDES, False)
         self.hold_captured = set()
         self.last_time = None
+
+    @property
+    def obstruction_status(self):
+        return {s: dict(v.status) for s, v in self.obstruction.items()} if self.obstruction_enabled else None
 
     def _fresh(self, timestamp, now):
         return math.isfinite(timestamp) and 0 <= now - timestamp <= self.timeout
@@ -122,6 +176,8 @@ class RampController:
                   and heartbeat.get('stop') is False)
         healthy = all(good.values()) and tf and hf and not trigger.get('stop', False)
         if not healthy:
+            for guard in self.obstruction.values():
+                guard.reset()
             failures = [f"{side}: {info['error']}" for side, info in self.feedback_status.items() if info['error']]
             reason = ("feedback " + "; ".join(failures) if failures else
                       'trigger invalid/stale/stop' if not tf or trigger.get('stop', False) else 'controller stopped/stale')
@@ -175,6 +231,12 @@ class RampController:
                 dq = measured[s][2] if len(measured[s]) >= 3 else 0.
                 self.target[s], self.endpoint_braking[s] = endpoint_braked_target(
                     lim, self.target[s], destination, measured[s][0], dq, dt)
+                if self.obstruction_enabled:
+                    self.target[s] = self.obstruction[s].update(
+                        lim, now, measured[s], trigger[s], self.target[s])
+                    if self.obstruction[s].hold_q is not None:
+                        self.motion[s] = "obstruction_hold"
+                        self.endpoint_braking[s] = False
         if opening and all(abs(self.target[s]-self.limits[s].command_open)<1e-9 for s in SIDES):
             # Wait for the physical grippers too: an obstruction must not arm closing.
             if all(abs(measured[s][0]-self.limits[s].command_open) <= .02*abs(self.limits[s].opened-self.limits[s].closed) for s in SIDES):

@@ -1,3 +1,4 @@
+#include "vibe_hybrid.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
  * @brief Main application: deploys an RL locomotion policy on the Unitree G1 robot.
@@ -335,6 +336,14 @@ class G1Deploy {
     
     // Independent logging counter (not affected by planner buffer cleaning)
     int logging_counter_ = 0;
+    std::unique_ptr<VibeHybridClient> hybrid_client_;
+    TimestampedData<LowState_> hybrid_snapshot_;
+    std::atomic<uint32_t> hybrid_ack_{UINT32_MAX};
+    std::atomic<uint32_t> hybrid_epoch_{0};
+    uint32_t hybrid_seen_ = UINT32_MAX;
+    std::atomic<uint32_t> hybrid_fault_{0};
+    std::atomic<uint32_t> hybrid_planner_tick_{0};
+    uint32_t hybrid_planner_seen_ = UINT32_MAX;
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
 
@@ -2616,11 +2625,11 @@ class G1Deploy {
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
                                                     &G1Deploy::LowCommandWriter, this);
       control_thread_ptr_ =
-          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
+          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, (vibe_hybrid_endpoint.empty() ? control_dt_ * 1e6 : 1000), &G1Deploy::Control, this);
       
       if (planner_) {
         planner_thread_ptr_ =
-          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
+          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, (vibe_hybrid_endpoint.empty() ? planner_dt_ * 1e6 : 1000), &G1Deploy::Planner, this);
       }
           
       SetThreadPriority();
@@ -2709,6 +2718,12 @@ class G1Deploy {
           dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
         }
 
+        if (!vibe_hybrid_endpoint.empty()) {
+          dds_low_command.reserve()[0]=VIBE_MAGIC;
+          dds_low_command.reserve()[1]=hybrid_ack_.load();
+          dds_low_command.reserve()[2]=hybrid_epoch_.load();
+          dds_low_command.reserve()[3]=hybrid_fault_.load();
+        }
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
         lowcmd_publisher_->Write(dds_low_command);
       }
@@ -2765,7 +2780,7 @@ class G1Deploy {
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
-      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      auto low_state_data = vibe_hybrid_endpoint.empty() ? low_state_buffer_.GetDataWithTime() : hybrid_snapshot_;
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       if (!ls) {
         return false;
@@ -2845,7 +2860,7 @@ class G1Deploy {
      *         exceeds the safety threshold (35 rad/s).
      */
     bool GatherRobotStateToLogger() {
-      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      auto low_state_data = vibe_hybrid_endpoint.empty() ? low_state_buffer_.GetDataWithTime() : hybrid_snapshot_;
       auto imu_data = imu_torso_buffer_.GetDataWithTime();
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       const std::shared_ptr<const IMUState_> imu_torso = imu_data.data;
@@ -3140,6 +3155,23 @@ class G1Deploy {
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
     bool CreatePolicyCommand() {
+      if (!vibe_hybrid_endpoint.empty() && !(planner_ && planner_->planner_state_.enabled)) {
+        try {
+          if(!hybrid_client_) hybrid_client_=std::make_unique<VibeHybridClient>(vibe_hybrid_endpoint);
+          const auto target=hybrid_client_->call(hybrid_seen_,hybrid_epoch_,true,{},ComputeApplyDeltaHeading());
+          MotorCommand command;
+          for(int i=0;i<G1_NUM_MOTOR;++i) {
+            command.q_target[i]=target[i];command.dq_target[i]=0;command.tau_ff[i]=0;
+            command.kp[i]=kps[i];command.kd[i]=kds[i];
+            last_action[isaaclab_to_mujoco[i]]=(target[i]-default_angles[i])/g1_action_scale[i];
+          }
+          motor_command_buffer_.SetData(command);
+          return true;
+        } catch(const std::exception& e) {
+          hybrid_fault_=1;std::cerr<<"HYBRID_STOP: "<<e.what()<<std::endl;return false;
+        }
+      }
+
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
@@ -3165,6 +3197,16 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      if (!vibe_hybrid_endpoint.empty()) {
+        try {
+          if(!hybrid_client_) hybrid_client_=std::make_unique<VibeHybridClient>(vibe_hybrid_endpoint);
+          std::array<float,29> candidate{};
+          for(int i=0;i<29;++i)candidate[i]=motor_command_tmp.q_target[i];
+          hybrid_client_->call(hybrid_seen_,hybrid_epoch_,false,candidate,ComputeApplyDeltaHeading());
+        } catch(const std::exception& e) {
+          hybrid_fault_=1;std::cerr<<"HYBRID_STOP: "<<e.what()<<std::endl;return false;
+        }
       }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -3598,6 +3640,12 @@ class G1Deploy {
      * and picked up by CurrentFrameAdvancement() in the control thread.
      */
     void Planner() {
+      if (!vibe_hybrid_endpoint.empty()) {
+        const uint32_t tick=hybrid_planner_tick_.load();
+        if (hybrid_planner_seen_!=UINT32_MAX && tick<hybrid_planner_seen_+100) return;
+        hybrid_planner_seen_=tick;
+      }
+
       if (operator_state.stop) { return; }
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
@@ -3837,6 +3885,33 @@ class G1Deploy {
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
     void Control() {
+      if (!vibe_hybrid_endpoint.empty()) {
+        auto snapshot=low_state_buffer_.GetDataWithTime();
+        if (!snapshot.data) return;
+        const auto tick=snapshot.data->tick();
+        const auto epoch=snapshot.data->reserve()[0];
+        if (snapshot.data->reserve()[1]!=VIBE_MAGIC) {
+          hybrid_fault_=1;operator_state.stop=true;return;
+        }
+        if (hybrid_seen_!=UINT32_MAX && tick==hybrid_seen_) return;
+        if (hybrid_seen_!=UINT32_MAX &&
+            (epoch!=hybrid_epoch_.load() || tick!=hybrid_seen_+20)) {
+          std::cerr<<"HYBRID_STOP: reset or skipped simulation control frame; restart controller"<<std::endl;
+          hybrid_fault_=1;operator_state.stop=true;return;
+        }
+        hybrid_snapshot_=snapshot;hybrid_seen_=tick;hybrid_epoch_=epoch;
+        hybrid_planner_tick_=tick;
+      }
+      struct HybridAck {
+        G1Deploy* self;
+        ~HybridAck() {
+          if (!vibe_hybrid_endpoint.empty()) {
+            if(self->operator_state.stop) self->hybrid_fault_=1;
+            self->hybrid_ack_=self->hybrid_seen_;
+          }
+        }
+      } hybrid_ack_guard{this};
+
       if (enable_dex1_heartbeat_) {
         const std::string status = operator_state.stop ? "STOP" :
             (program_state_ == ProgramState::INIT ? "INIT" :
@@ -4156,6 +4231,20 @@ static bool parse_motor_gain_scale_flag(
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
 int main(int argc, char const* argv[]) {
+  for (int i=4;i<argc;++i) {
+    if(std::string(argv[i])=="--vibe-hybrid-endpoint") {
+      if(i+1>=argc || std::string(argv[1])!="lo") {
+        std::cerr<<"Hybrid only supports loopback simulation"<<std::endl;return 2;
+      }
+      vibe_hybrid_endpoint=argv[i+1];
+      if(vibe_hybrid_endpoint!="tcp://127.0.0.1:5581") {
+        std::cerr<<"Hybrid worker must use fixed loopback endpoint"<<std::endl;return 2;
+      }
+      for(int j=i;j+2<argc;++j)argv[j]=argv[j+2];
+      argc-=2;--i;
+    }
+  }
+
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
