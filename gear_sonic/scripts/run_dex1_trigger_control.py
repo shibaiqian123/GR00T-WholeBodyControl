@@ -90,6 +90,38 @@ class PacketReader:
                 fault={'time':invalid_time,'sample_time':invalid_time,'valid':False,'stop':True,'state':'STOP'}
         return fault if fault is not None else self.latest
 
+class TargetReader:
+    """Same-host absolute targets, converted into the existing protected controller input."""
+    def __init__(self, socket, limits):
+        self.socket, self.limits = socket, limits
+        self.latest = None
+        self.last_time = -math.inf
+        self.last_error = ''
+    def poll(self):
+        import msgpack, zmq
+        from gear_sonic.utils.inference.dit4dit_control import target_to_trigger
+        fault = None
+        for _ in range(100):
+            try:
+                raw = self.socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            try:
+                if not raw.startswith(b'dex1_target '):
+                    raise ValueError('target topic')
+                packet = msgpack.unpackb(raw[len(b'dex1_target '):], raw=False)
+                target = target_to_trigger(packet, self.limits, time.monotonic())
+                if target['time'] <= self.last_time:
+                    continue
+                self.last_time = target['time']
+                self.latest = target
+                self.last_error = ''
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                self.last_error = str(exc)
+                fault = dict(time=time.monotonic(),sample_time=0.,valid=False,stop=True)
+        return fault if fault is not None else self.latest
+
+
 def read_limits(path):
     data=json.loads(path.read_text())
     if data.get('units') != 'motor_output_radians':
@@ -121,14 +153,17 @@ def main():
     p.add_argument('--feedback-timeout',type=float,default=.25)
     p.add_argument('--trigger-port',type=int,default=5556)
     p.add_argument('--status-port',type=int,default=5557)
+    p.add_argument('--target-port',type=int,default=0,help='Opt-in unified gateway absolute Dex1 targets; replaces trigger input')
     p.add_argument('--telemetry-port',type=int,default=0,help='Optional local Dex1 recording PUB port; 0 disables')
     p.add_argument('--kp',type=float,default=5.)
     p.add_argument('--kd',type=float,default=.05)
     p.add_argument('--observe',action='store_true',help='Read-only Dex1 feedback for ten seconds; no endpoint file required')
+    p.add_argument('--feedback-only',action='store_true',help='Publish measured telemetry only; never arm or command grippers')
     p.add_argument('--execute',action='store_true',help='Enable real DDS motor commands; otherwise receive-only dry-run')
     p.add_argument('--demo',action='store_true',help='Offline demonstration with virtual feedback; no DDS/ZMQ')
     a=p.parse_args()
     if a.telemetry_port and not 1024 <= a.telemetry_port <= 65535:p.error('Invalid telemetry port')
+    if a.feedback_only and (a.execute or a.observe or a.demo):p.error('--feedback-only excludes --execute/--observe/--demo')
     if a.observe and (a.execute or a.demo):p.error("--observe cannot be combined with --execute or --demo")
     if a.demo:
         if a.execute:p.error('--demo cannot be combined with --execute')
@@ -150,10 +185,10 @@ def main():
     except (ValueError,TypeError,KeyError,OSError) as exc:p.error(str(exc))
     import zmq
     context=zmq.Context();sockets=[]
-    for port,topic in [(a.trigger_port,b'dex1_trigger '),(a.status_port,b'dex1_control_status ')]:
+    for port,topic in [(a.target_port or a.trigger_port,b'dex1_target ' if a.target_port else b'dex1_trigger '),(a.status_port,b'dex1_control_status ')]:
         sock=context.socket(zmq.SUB);sock.setsockopt(zmq.LINGER,0);sock.setsockopt(zmq.RCVHWM,5)
         sock.setsockopt(zmq.SUBSCRIBE,topic);sock.connect(f'tcp://127.0.0.1:{port}');sockets.append(sock)
-    triggers=PacketReader(sockets[0],b'dex1_trigger ',True)
+    triggers=(TargetReader(sockets[0], c.limits) if a.target_port else PacketReader(sockets[0],b'dex1_trigger ',True))
     status=PacketReader(sockets[1],b'dex1_control_status ')
     dds=None
     telemetry=None
@@ -173,7 +208,9 @@ def main():
                 resume=key=='r'
             tr=triggers.poll();hb=status.poll();measured=dds.snapshot()
             now=time.monotonic()
-            targets=c.update(now,measured,tr,hb,resume)
+            if a.target_port and tr and tr.get('mode') == 'model' and c.phase != 'READY':
+                tr = dict(tr, valid=False, stop=True)
+            targets={} if a.feedback_only else c.update(now,measured,tr,hb,resume)
             try:
                 dds.write(targets)
             finally:
