@@ -54,6 +54,7 @@
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
+#include "streamed_token_start.hpp"
 #include "zmq_endpoint_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "../localmotion_kplanner.hpp"  // For LocomotionMode enum
@@ -318,6 +319,7 @@ class ZMQManager : public InputInterface {
         report_temperature_flag_ = false;
       }
       if (emergency_stop_) {
+        if (start_control_) std::cout << "[ZMQManager] Start blocked: keyboard stop has priority" << std::endl;
         operator_state.stop = true;
         if (planner_state.enabled) {
           planner_state.enabled = false;
@@ -341,6 +343,7 @@ class ZMQManager : public InputInterface {
 
       // Handle stop control
       if (stop_control_) {
+        if (start_control_) std::cout << "[ZMQManager] Start blocked: command stop has priority" << std::endl;
         operator_state.stop = true;
         if (planner_state.enabled) {
           planner_state.enabled = false;
@@ -358,6 +361,12 @@ class ZMQManager : public InputInterface {
         
         // Clear hand joints control state
         has_hand_joints_ = false;
+        return;
+      }
+
+      if (operator_state.stop) {
+        if (start_control_) std::cout << "[ZMQManager] Start blocked: existing stop latch" << std::endl;
+        return;
       }
 
       // Delegate based on current mode
@@ -376,6 +385,18 @@ class ZMQManager : public InputInterface {
                                        heading_state_buffer,
                                        has_planner, planner_state, movement_state_buffer,
                                        current_motion_mutex, report_temperature);
+          // Network start belongs to the manager; the pose interface only sees its own keys.
+          std::lock_guard<std::mutex> lock(current_motion_mutex);
+          const auto result = sonic::ApplyTokenStart(start_control_, operator_state.stop,
+              pose_interface_->HasExternalTokenState(), operator_state.start,
+              operator_state.play, reinitialize_heading);
+          if (result == sonic::TokenStartResult::Applied) {
+            std::cout << "[ZMQManager] Streamed token start applied: operator_state.start=true" << std::endl;
+          } else if (result == sonic::TokenStartResult::Stopped) {
+            std::cout << "[ZMQManager] Start blocked: pose stop has priority" << std::endl;
+          } else if (result == sonic::TokenStartResult::MissingToken) {
+            std::cout << "[ZMQManager] Start rejected: streamed token not ready; new request required" << std::endl;
+          }
         }
       }
     }
@@ -745,6 +766,10 @@ class ZMQManager : public InputInterface {
         }
       }
       
+      if (cmd.start) {
+        std::cout << "[ZMQManager] Network start received: stop=" << cmd.stop
+                  << ", planner=" << cmd.planner << std::endl;
+      }
       // Update buffer with OR logic to accumulate start/stop signals
       std::lock_guard<std::mutex> lock(command_mutex_);
       

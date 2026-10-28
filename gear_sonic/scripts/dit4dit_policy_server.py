@@ -1,4 +1,4 @@
-"""Same-host DiT4DiT inference service. Never imports robot control or sends commands."""
+"""Remote-capable DiT4DiT inference service. Never imports robot control or sends commands."""
 import argparse
 import base64
 import io
@@ -37,7 +37,7 @@ def main():
     sock = ctx.socket(zmq.REP)
     sock.setsockopt(zmq.LINGER,0)
     sock.bind(f'tcp://127.0.0.1:{a.port}')
-    print('READY: local inference only; no robot command sockets',flush=True)
+    print('READY: loopback inference service; SSH forwarding supported; no robot command sockets',flush=True)
     try:
         while True:
             req = sock.recv_json()
@@ -45,8 +45,9 @@ def main():
                 if req.get('op') == 'ping':
                     sock.send_json({'ok':True,'checkpoint':a.checkpoint}); continue
                 observed = float(req['observed_at'])
-                if not 0 <= time.monotonic()-observed <= .5:
-                    raise ValueError('Stale observation')
+                # Opaque client timestamp: only the client checks age on its own clock.
+                if not np.isfinite(observed):
+                    raise ValueError('Invalid observation timestamp')
                 image = Image.open(io.BytesIO(base64.b64decode(req['image_png'],validate=True))).convert('RGB')
                 image = image.resize((224,224),Image.Resampling.BILINEAR)
                 example = dict(image=[image],lang=req['lang'],state=normalize_state(req['state'],stats['state']))

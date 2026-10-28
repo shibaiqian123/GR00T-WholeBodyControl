@@ -57,7 +57,10 @@ def main():
     p.add_argument('--log-dir',type=Path,required=True)
     p.add_argument('--duration',type=float,default=0,help='Seconds, 0 until quit')
     p.add_argument('--execute',action='store_true')
+    p.add_argument('--readonly-body-port',type=int,default=None,help='Dedicated DDS observer, read-only use only (normally 5564)')
     a=p.parse_args()
+    if a.execute and a.readonly_body_port is not None:
+        p.error('--readonly-body-port cannot be combined with --execute')
     import zmq, msgpack
     from PIL import Image
     from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
@@ -66,6 +69,7 @@ def main():
     from gear_sonic.scripts.run_dex1_trigger_control import PacketReader, read_limits
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_command_message, pack_pose_message
     ports=[a.camera_port,a.state_port,a.dex_telemetry_port,a.pico_port,a.policy_port,a.action_port,a.target_port]
+    if a.readonly_body_port is not None:ports.append(a.readonly_body_port)
     if len(set(ports))!=len(ports) or not all(1024<=x<=65535 for x in ports):
         p.error('All ports must be distinct and unprivileged')
     limits=read_limits(a.limits)
@@ -82,9 +86,9 @@ def main():
         s=ctx.socket(zmq.SUB);s.setsockopt(zmq.LINGER,0);s.setsockopt(zmq.RCVHWM,100)
         s.setsockopt(zmq.SUBSCRIBE,topic);s.connect(f'tcp://127.0.0.1:{port}');sockets.append(s)
         return s
-    pico=sub(a.pico_port,b'')
-    hb_socket=sub(a.state_port,b'dex1_control_status ')
-    hb=PacketReader(hb_socket,b'dex1_control_status ')
+    pico=sub(a.pico_port,b'') if a.readonly_body_port is None else None
+    hb_socket=sub(a.state_port,b'dex1_control_status ') if a.readonly_body_port is None else None
+    hb=PacketReader(hb_socket,b'dex1_control_status ') if hb_socket is not None else None
     dex=sub(a.dex_telemetry_port,b'dex1_telemetry ')
     pub=targets=None
     if a.execute:
@@ -93,7 +97,11 @@ def main():
             s.bind(f'tcp://127.0.0.1:{port}');sockets.append(s);return s
         pub=publisher(a.action_port);targets=publisher(a.target_port)
     camera=ComposedCameraClientSensor('127.0.0.1',a.camera_port)
-    body=ZMQStateSubscriber('127.0.0.1',a.state_port)
+    if a.readonly_body_port is None:
+        body=ZMQStateSubscriber('127.0.0.1',a.state_port)
+    else:
+        from gear_sonic.utils.inference.readonly_body import ReadOnlyBodySubscriber
+        body=ReadOnlyBodySubscriber(a.readonly_body_port)
     arb=Arbiter();requests=queue.Queue(maxsize=1);replies=queue.Queue();done=threading.Event()
     thread=threading.Thread(target=worker,args=(f'tcp://127.0.0.1:{a.policy_port}',requests,replies,done),daemon=True)
     thread.start()
@@ -103,10 +111,13 @@ def main():
     record('startup',execute=a.execute,mode=arb.mode,controls='teleop/model/stop/reset/quit + Enter')
     try:
         while not a.duration or time.monotonic()-started<a.duration:
-            tick=time.monotonic();arb.status(hb.poll(),tick)
+            tick=time.monotonic()
+            if hb is not None:arb.status(hb.poll(),tick)
             bm=body.get_msg()
             if bm is not None:
-                body_msg=bm;body_at=tick
+                body_msg=bm;body_at=bm['sample_time'] if a.readonly_body_port is not None else tick
+            elif a.readonly_body_port is not None:
+                body_msg=None;body_at=-1.
             for _ in range(100):
                 try:
                     raw=dex.recv(zmq.NOBLOCK)
@@ -139,7 +150,7 @@ def main():
             except (KeyError,TypeError,ValueError,AttributeError):
                 sensor_ok=False
             dex_ready=bool(dex_msg and fresh(dex_msg['time'],now) and dex_msg.get('phase')==4)
-            for _ in range(100):
+            for _ in range(100 if pico is not None else 0):
                 try:
                     raw=pico.recv(zmq.NOBLOCK)
                 except zmq.Again:
@@ -204,7 +215,9 @@ def main():
                 req=dict(op='infer',generation=arb.generation,request_id=request_id,
                          observed_at=observed_at,state=state.tolist(),lang=a.task_prompt,
                          image_png=base64.b64encode(buffer.getvalue()).decode('ascii'))
-                np.savez_compressed(a.log_dir/f'input_{request_id:06d}.npz',image=img,state=state,observed_at=observed_at)
+                np.savez_compressed(a.log_dir/f'input_{request_id:06d}.npz',image=img,state=state,observed_at=observed_at,body_sample_time=body_at,
+                                    body_source_tick=body_msg.get('source_tick',-1),
+                                    dex_feedback_time=np.array([x['feedback_time'] for x in feedback]),image_wall_time=image_stamp)
                 requests.put_nowait(req);busy=True;last_request=now;request_id+=1
             if arb.mode=='model' and not dex_ready:
                 arb.stop('dex1_not_ready')
@@ -233,6 +246,8 @@ def main():
                 record('mode',mode=arb.mode,reason=arb.reason,generation=arb.generation);last_mode=arb.mode
             if now-last_health>=1:
                 record('health',mode=arb.mode,sensors_ok=bool(sensor_ok),pico_ok=pico_ok,dex_ready=dex_ready,busy=busy,
+                       body_source='readonly_dds' if a.readonly_body_port is not None else 'bottom',
+                       body_error=body.cache.error if a.readonly_body_port is not None else '',
                        camera_age_seconds=image_age,body_age_seconds=now-body_at if body_msg else None,
                        dex_feedback_present=bool(dex_msg and all(dex_msg['sides'][s].get('feedback_valid') for s in ('left','right'))))
                 last_health=now

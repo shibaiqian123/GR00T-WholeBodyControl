@@ -8,7 +8,7 @@
 - 关节排列沿用数据采集的 robot_model 映射后，再取 whole_q[0:22] + whole_q[29:36]，追加左右 Dex1 实测位置。不能直接把 DDS body_q 的顺序当作训练顺序。
 - 当前图像按训练使用的 RGB/BILINEAR 224×224 处理；只给当前图像，不给未来帧。任务文字沿用采集任务。
 - 前64维使用 SONIC protocol v4 token_state；后2维是 motor_output_radians 绝对夹爪目标。通过标定逆映射传入原 RampController，保留反馈失效、限位、端点减速、堵转保护和故障保持；不使用旧7+7手部字段。
-- 相机/身体/Dex1观测必须在0.25秒内，组装时间差不超过0.15秒。动作从图像时间计算索引，50Hz、50帧，满1秒即过期。身体状态新鲜度当前以本地收到 g1_debug 为依据，不能证明 DDS 生产端未冻结。
+- 相机/身体/Dex1观测必须在0.25秒内，组装时间差不超过0.15秒。动作从图像时间计算索引，50Hz、50帧，满1秒即过期。只读源使用DDS接收时间及tick检查，重复发布不能刷新年龄。运动源保留原5557心跳及 g1_debug，不自动切换到只读源。
 - 请求最多一个在途；接管/停止递增 generation，旧回复不能恢复控制。模型错误、动作过期、观测失效、Dex1离开READY或底层心跳失效会停止模型。
 - 唯一机器人发布者为 gateway：5556发送身体消息，5563发送Dex1目标。PICO改用5562；状态5557、相机5555、Dex1实测遥测5559不变。
 
@@ -50,21 +50,17 @@ cd /home/cqu023/GR00T-WholeBodyControl
   --view right --publish-camera-port 5555 --preview
 ```
 
-### 终端3：原底层服务
-
-需要身体状态及控制状态输出，使用原先已验证的启动方式。不要为了只读测试按启动运动的键。是否在等待控制阶段发布身体状态须以 gateway 的 health 为准；缺失时不能绕过检查。
+### 终端3：独立身体状态订阅（不启动底层运动控制）
 
 ```bash
-cd /home/cqu023/GR00T-WholeBodyControl/gear_sonic_deploy
-./deploy.sh \
-  --cp policy/sonic_v1_1/model \
-  --obs-config policy/sonic_v1_1/observation_config.yaml \
-  --input-type zmq_manager \
-  --motor-kp-scale 4,10=1.5 \
-  --motor-kd-scale 4,10=1.5 \
-  --enable-dex1-heartbeat \
-  enx6c1ff7b8d821
+cd /home/cqu023/GR00T-WholeBodyControl
+.venv_teleop/bin/python -u -m gear_sonic.scripts.run_dit4dit_body_observer \
+  --interface enx6c1ff7b8d821 --port 5564
 ```
+
+只订阅 DDS `rt/lowstate`，不创建电机命令发布者。本地5564专用主题 `dit4dit_body_readonly` 包含源tick、会话/序号、接收单调时间和有效标志。源tick重复、倒退、非有限关节或超过0.25秒均不可用；机器人重启使tick回退时，重启订阅器。`valid=false / no_dds_feedback` 表示真实反馈缺失，不应启动运动来补数据。
+
+底层 logger 的重排和减偏置，与 g1_debug 发布端的逆重排和加偏置相消，因此此处29维绝对角度等于 DDS 前29电机位置；之后仍通过采集 robot_model 转成训练顺序，不能直接作为31维状态前29项。
 
 ### 终端4：仅接收夹爪反馈
 
@@ -86,6 +82,7 @@ cd /home/cqu023/GR00T-WholeBodyControl
   --task-prompt "Pick up the cup on the left with your left gripper. Then pick up the red block on the right with your right gripper and place it into the cup held in your left gripper. Finally, place the cup, with the red block inside, back on the table using your left gripper." \
   --limits gear_sonic/configs/dex1_limits.g1_20261013.json \
   --log-dir "outputs/dit4dit_readonly_$(date +%Y%m%d_%H%M%S)" \
+  --readonly-body-port 5564 \
   --duration 60
 ```
 
@@ -97,7 +94,19 @@ cd /home/cqu023/GR00T-WholeBodyControl
 
 先完成A阶段。现场有人看护、防跌保护到位，在可操作的底层终端验证 O。此阶段尚未自动执行。
 
-1. 停止只读 gateway 和 feedback-only 进程；保留相机与模型服务。
+1. 停止只读 gateway、独立身体订阅器和 feedback-only 进程；保留相机与模型服务。运动阶段启动原底层服务（仅现场验收时）：
+
+```bash
+cd /home/cqu023/GR00T-WholeBodyControl/gear_sonic_deploy
+./deploy.sh \
+  --cp policy/sonic_v1_1/model \
+  --obs-config policy/sonic_v1_1/observation_config.yaml \
+  --input-type zmq_manager \
+  --motor-kp-scale 4,10=1.5 \
+  --motor-kd-scale 4,10=1.5 \
+  --enable-dex1-heartbeat \
+  enx6c1ff7b8d821
+```
 2. PICO改到独立上游端口：
 
 ```bash
@@ -117,7 +126,7 @@ cd /home/cqu023/GR00T-WholeBodyControl
   --travel-time 2 --obstruction-hold --obstruction-timeout 0.5 --execute
 ```
 
-4. 将A阶段终端5命令的 `--duration 60` 改成 `--execute`，改用新的日志目录。gateway 初始仍为 readonly。
+4. 删除A阶段终端5命令的 `--readonly-body-port 5564`，将 `--duration 60` 改成 `--execute`，改用新的日志目录。gateway 初始仍为 readonly。
 5. 按原PICO操作进入 PLANNER，使上游有新鲜 planner 和有效扳机数据。在 gateway 输入 `teleop` + Enter 才将控制权交给PICO并请求底层启动。首次夹爪仍执行原有张开/松开扳机解锁流程，确认READY。
 6. 先验证底层 `O`：gateway 必须进入 stop，后续输入 model 必须被拒绝。重启底层/PICO，待心跳恢复后手动 reset，重新进入teleop。故障保持的夹爪需按原规则在输入新鲜且双扳机松开时，手动 R 恢复。
 7. 有 fresh prediction、sensors_ok=true、dex_ready=true 且底层CONTROL后，在 gateway 输入 `model` + Enter。模型实际输出开始下发。
@@ -137,3 +146,25 @@ cd /home/cqu023/GR00T-WholeBodyControl
 ```
 
 后者只使用随机16000以上的localhost端口、模拟相机/身体/Dex1/PICO/模型，不创建DDS连接。验证停止、相机断流、推理超时与PICO接管后不再出现模型token。模拟通过不等于实机 O 和控制模式切换已验收。
+
+### 只读缺失状态诊断
+
+`health.body_error` 为 no_body_packet：检查5564观察器；no_dds_feedback：检查指定网口和机器人DDS反馈；expired：反馈中断。`dex_feedback_present=false`：检查Dex1左右实测反馈，禁止填零。camera_age_seconds为空或过大：检查现有相机桥。只有三者新鲜且时间差合格才请求模型；feedback-only 的 dex_ready=false 不阻塞只读推理。
+
+只读选项与 --execute 互斥，解析阶段拒绝，不创建动作端口。A阶段不启动底层、不伪造CONTROL心跳。输入NPZ记录原图、31维状态、各传感器时间和DDS tick；events.jsonl记录预测及延迟。
+
+测试：`.venv_data_collection/bin/python -m unittest gear_sonic.utils.inference.test_readonly_body -v`。不同数值关节和非零偏置用于验证两次映射抵消及训练排列。
+
+## 2026-10-28 A阶段实测
+
+已完成60秒真实观测只读运行，139次推理成功，归一化与反归一化动作均为有限50×66；140份真实输入均为有限31维（退出时最后一个请求未收回）。启动连接阶段1条health无反馈，其后56条health均有效。推理中位235ms、P95 244ms；观测到回复中位451ms、P95 465ms，最慢989ms，未见超过1秒的回复。归一化输出越界比例平均0.84%，只记录未下发。
+
+报告：`outputs/readonly_dds_live_20261028_160237/REPORT.md`；原始输入、预测、时间戳、DDS/Dex1日志和端口采样保留在该目录。未创建5556/5563动作监听端口，未启动运动。测试服务已清理，相机桥保留。真实O停止与PICO接管仍待现场验收。
+
+新增端到端只读测试：
+
+```bash
+.venv_data_collection/bin/python -m gear_sonic.utils.inference.test_readonly_transport
+```
+
+该测试使用随机本地端口、模拟输入及模型，确认新身体源可以组成31维输入、身体过期后停止请求推理，且无需绑定动作端口。

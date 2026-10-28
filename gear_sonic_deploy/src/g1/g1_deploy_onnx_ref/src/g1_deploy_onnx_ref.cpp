@@ -3916,7 +3916,7 @@ class G1Deploy {
         const std::string status = operator_state.stop ? "STOP" :
             (program_state_ == ProgramState::INIT ? "INIT" :
              program_state_ == ProgramState::WAIT_FOR_CONTROL ? "WAIT_FOR_CONTROL" : "CONTROL");
-        for (auto& output : output_interfaces_) output->publish_control_status(status, operator_state.stop);
+        for (auto& output : output_interfaces_) output->publish_control_status(status, operator_state.stop, input_interface_ && input_interface_->HasExternalTokenState());
       }
       if (operator_state.stop) { return; }
 

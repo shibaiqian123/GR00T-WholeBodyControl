@@ -158,10 +158,12 @@ def main():
     p.add_argument('--kp',type=float,default=5.)
     p.add_argument('--kd',type=float,default=.05)
     p.add_argument('--observe',action='store_true',help='Read-only Dex1 feedback for ten seconds; no endpoint file required')
+    p.add_argument('--model-only',action='store_true',help='Require explicit arm_id hold-current command; no VR or auto-opening')
     p.add_argument('--feedback-only',action='store_true',help='Publish measured telemetry only; never arm or command grippers')
     p.add_argument('--execute',action='store_true',help='Enable real DDS motor commands; otherwise receive-only dry-run')
     p.add_argument('--demo',action='store_true',help='Offline demonstration with virtual feedback; no DDS/ZMQ')
     a=p.parse_args()
+    if a.model_only and (not a.target_port or a.feedback_only or a.observe or a.demo):p.error('--model-only requires --target-port and excludes feedback-only/observe/demo')
     if a.telemetry_port and not 1024 <= a.telemetry_port <= 65535:p.error('Invalid telemetry port')
     if a.feedback_only and (a.execute or a.observe or a.demo):p.error('--feedback-only excludes --execute/--observe/--demo')
     if a.observe and (a.execute or a.demo):p.error("--observe cannot be combined with --execute or --demo")
@@ -190,10 +192,12 @@ def main():
         sock.setsockopt(zmq.SUBSCRIBE,topic);sock.connect(f'tcp://127.0.0.1:{port}');sockets.append(sock)
     triggers=(TargetReader(sockets[0], c.limits) if a.target_port else PacketReader(sockets[0],b'dex1_trigger ',True))
     status=PacketReader(sockets[1],b'dex1_control_status ')
+    from gear_sonic.utils.inference.model_only_control import ModelGripInput
+    model_input=ModelGripInput() if a.model_only else None
     dds=None
     telemetry=None
     print('EXECUTE: motor commands enabled' if a.execute else 'DRY-RUN: no DDS command publishers are created',flush=True)
-    print('R + Enter: resume a latched hold, only with fresh data and both triggers released. Q + Enter: exit (holding ceases).',flush=True)
+    print(('Model-only: recover/reset/arm in gateway; R does not resume. Q + Enter: exit (holding ceases).' if a.model_only else 'R + Enter: resume a latched hold, only with fresh data and both triggers released. Q + Enter: exit (holding ceases).'),flush=True)
     try:
         if a.telemetry_port:
             from gear_sonic.utils.teleop.dex1_recording import Publisher
@@ -210,7 +214,10 @@ def main():
             now=time.monotonic()
             if a.target_port and tr and tr.get('mode') == 'model' and c.phase != 'READY':
                 tr = dict(tr, valid=False, stop=True)
-            targets={} if a.feedback_only else c.update(now,measured,tr,hb,resume)
+            if model_input is not None:
+                targets=model_input.update(c,tr,measured,hb,now)
+            else:
+                targets={} if a.feedback_only else c.update(now,measured,tr,hb,resume)
             try:
                 dds.write(targets)
             finally:
