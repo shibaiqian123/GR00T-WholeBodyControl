@@ -65,3 +65,19 @@ cd /home/cqu023/GR00T-WholeBodyControl
 - 隔离MuJoCo中验证真实控制线程与DDS发送路径、O停止、恢复PLANNER时序、目标连续性及日志无丢失。
 - 确认是否存在首目标跳变；本功能不修复原跳变，也不是姿态过渡方案。
 - 在上述完成前保持实机模型切换暂停。
+
+
+## 隔离仿真配置与启动（2026-10-29）
+prepare_sim_single_step.py 从匹配 G1 URDF 读取硬件顺序29关节的位置和速度范围，
+生成 simulation_only 配置；max_delta=URDF velocity*0.02秒，仅为仿真测试规则，
+不是经实机验证的安全目标跳变量，也不是允许放宽既有限制的依据。
+记录来源文件哈希和关节名称。仿真配置在创建DDS实体之前拒绝非域38、非lo及
+CYCLONEDDS_URI覆盖。没有仿真入口自动退回实机配置的行为。
+
+保持域38/lo的MuJoCo运行；停止旧的仿真底层后，在仓库根执行
+bash gear_sonic/scripts/launch_sim_single_step_bottom.sh。该命令创建独立日志及配置，
+启用15558；不会自动进入PLANNER或发送token。
+仍需通过15556发送一次 start=true,stop=false,planner=true，再查询单帧接口ready。
+ready=false或超限必须停下排查；不自动重试、不改限值。
+单帧之后仍按原实现返回PLANNER；不是INIT直接下发路径，不控制Dex1。
+初次status超时的文案现在明确说明本次调用没有发送执行请求。
