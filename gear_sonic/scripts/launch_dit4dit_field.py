@@ -13,9 +13,13 @@ p.add_argument('--session',default='dit4dit_field')
 p.add_argument('--policy-ssh',default='2025slx@10.246.1.32',help='SSH inference host; service must already be running on its loopback 5560')
 p.add_argument('--interface',default='enx6c1ff7b8d821')
 p.add_argument('--task-prompt',default='Pick up the cup on the left with your left gripper. Then pick up the red block on the right with your right gripper and place it into the cup held in your left gripper. Finally, place the cup, with the red block inside, back on the table using your left gripper.')
+p.add_argument('--inference-mode',choices=('async','sync'),default='async')
+p.add_argument('--segment-frames',type=int,default=10)
 p.add_argument('--dry-run',action='store_true')
 p.add_argument('--no-attach',action='store_true')
 a=p.parse_args()
+if not 1<=a.segment_frames<=50:p.error("--segment-frames must be 1..50")
+if a.inference_mode=="sync" and a.segment_frames==50:p.error("50 frames exceed the unchanged action horizon once inference takes time")
 if not a.session or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in a.session):p.error('Invalid session name')
 root=Path(__file__).resolve().parents[2];session=a.session
 out=root/'outputs'/('model_only_'+time.strftime('%Y%m%d_%H%M%S'))
@@ -25,8 +29,10 @@ commands=[
  ('bottom','cd '+shlex.quote(str(root/'gear_sonic_deploy'))+' && '+shlex.join(['./deploy.sh','--cp','policy/sonic_v1_1/model','--obs-config','policy/sonic_v1_1/observation_config.yaml','--input-type','zmq_manager','--motor-kp-scale','4,10=1.5','--motor-kd-scale','4,10=1.5','--enable-dex1-heartbeat',a.interface])),
  ('observations',shlex.join([tele,'-u','-m','gear_sonic.scripts.run_model_observers','--interface',a.interface])),
  ('dex1',shlex.join([tele,'-u','-m','gear_sonic.scripts.run_dex1_trigger_control','--interface',a.interface,'--limits',limits,'--model-only','--target-port','5563','--telemetry-port','5559','--travel-time','2','--obstruction-hold','--obstruction-timeout','0.5','--execute'])),
- ('gateway',shlex.join([data,'-u','-m','gear_sonic.scripts.run_dit4dit_model','--task-prompt',task,'--limits',limits,'--log-dir',str(out/'gateway'),'--execute'])),
+ ('gateway',shlex.join([data,'-u','-m','gear_sonic.scripts.run_dit4dit_model','--task-prompt',task,'--limits',limits,'--log-dir',str(out/'gateway'),'--inference-mode',a.inference_mode,'--segment-frames',str(a.segment_frames),'--execute'])),
  ('tunnel',shlex.join(['ssh','-N','-T','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=10','-o','ServerAliveCountMax=3','-L','127.0.0.1:5560:127.0.0.1:5560',a.policy_ssh]))]
+if a.inference_mode=='sync':
+    print('SYNC: arm holds grippers; manual model requests a fresh prediction then starts. SONIC continues last token during inference; NOT stationary hold. Existing age/stop limits apply.')
 if a.dry_run:
     print('REMOTE MODEL: no local DiT4DiT GPU load. Start policy on server first; tunnel pane may ask for SSH password. Manual arm/model.')
     for name,command in commands:print(name+'\n'+command+'\n')
