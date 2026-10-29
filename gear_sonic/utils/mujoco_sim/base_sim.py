@@ -427,6 +427,9 @@ class DefaultEnv:
             self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
         else:
             self.mj_data.ctrl = self.torques
+        if os.environ.get("SONIC_SIM_AUDIT"):
+            from gear_sonic.utils.mujoco_sim.startup_capture import capture
+            capture(self)
         mujoco.mj_step(self.mj_model, self.mj_data)
 
         self.check_fall()
@@ -597,6 +600,12 @@ class BaseSimulator:
 
     def start(self):
         """Main simulation loop"""
+        if os.environ.get("SONIC_SIM_TIMING"):
+            from gear_sonic.utils.mujoco_sim.loop_timing import install
+            install(self)
+        if os.environ.get("SONIC_SIM_AUDIT"):
+            from gear_sonic.utils.mujoco_sim.startup_capture import prepare
+            prepare(self.sim_env)
         sim_cnt = 0
         ts = time.time()
 
@@ -627,6 +636,10 @@ class BaseSimulator:
                 # Simple rate limiter (replaces ROS rate)
                 elapsed = time.monotonic() - step_start
                 sleep_time = self.sim_dt - elapsed
+                if os.environ.get("SONIC_SIM_TIMING"):
+                    from gear_sonic.utils.mujoco_sim.loop_timing import record
+                    record("loop_work", step_start, time.monotonic())
+                    record("deadline_lateness", step_start, step_start + max(0.0, -sleep_time))
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
@@ -644,6 +657,12 @@ class BaseSimulator:
 
     def close(self):
         self._running = False
+        if os.environ.get("SONIC_SIM_AUDIT"):
+            from gear_sonic.utils.mujoco_sim.startup_capture import close
+            close()
+        if os.environ.get("SONIC_SIM_TIMING"):
+            from gear_sonic.utils.mujoco_sim.loop_timing import close
+            close()
         try:
             if self.sim_env.image_publish_process is not None:
                 self.sim_env.image_publish_process.stop()

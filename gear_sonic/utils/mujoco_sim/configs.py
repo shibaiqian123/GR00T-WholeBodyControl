@@ -91,6 +91,11 @@ def override_wbc_config(
         "enable_natural_walk": config.enable_natural_walk,
     }
 
+    if config.dds_domain is not None:
+        if not 0 <= config.dds_domain <= 232:
+            raise ValueError("DDS domain must be in 0..232")
+        key_to_value["DOMAIN_ID"] = config.dds_domain
+
     if missed_keys_only:
         for key in key_to_value:
             if key not in wbc_config:
@@ -124,6 +129,9 @@ class BaseConfig(ArgsConfigTemplate):
     """Whole body policy class."""
 
     # System Configuration
+    dds_domain: int | None = None
+    """Explicit DDS domain; None preserves the original YAML value."""
+
     interface: str = "sim"
     """Interface to use for the control loop. [sim, real, lo, enxe8ea6a9c4e09]"""
 

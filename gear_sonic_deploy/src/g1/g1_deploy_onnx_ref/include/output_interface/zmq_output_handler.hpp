@@ -129,7 +129,7 @@ public:
      * @param port    TCP port to bind the PUB socket to (e.g. 5557).
      * @param topic   Topic prefix prepended to each published message.
      */
-    explicit ZMQOutputHandler(StateLogger& logger, int port, const std::string& topic) 
+    explicit ZMQOutputHandler(StateLogger& logger, int port, const std::string& topic, const std::string& bind_host = "*")
         : OutputInterface(logger), realtime_debug_context_(1), topic_(topic),
           robot_config_topic_("robot_config") {
 
@@ -140,7 +140,7 @@ public:
         realtime_debug_socket_->set(zmq::sockopt::sndhwm, 10);     // Drop old messages quickly
         realtime_debug_socket_->set(zmq::sockopt::sndbuf, 32768);   // 32 KB send buffer
         realtime_debug_socket_->set(zmq::sockopt::linger, 0);       // No lingering on close
-        realtime_debug_socket_->bind("tcp://*:" + std::to_string(port));
+        realtime_debug_socket_->bind("tcp://" + bind_host + ":" + std::to_string(port));
 
         std::cout << "[INFO] Realtime debug socket bound to port: " << port << std::endl;
 

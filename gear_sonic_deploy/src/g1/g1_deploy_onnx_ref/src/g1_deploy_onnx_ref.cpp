@@ -2199,7 +2199,7 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {}, bool enable_dex1_heartbeat = false)
+      MotorGainScaleConfig motor_gain_scales = {}, bool enable_dex1_heartbeat = false, int dds_domain = 0, std::string zmq_out_host = "*")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2235,7 +2235,8 @@ class G1Deploy {
       
       enable_dex1_heartbeat_ = enable_dex1_heartbeat;
       // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      ChannelFactory::Instance()->Init(dds_domain, networkInterface);
+      std::cout << "[DDS] domain=" << dds_domain << " interface=" << networkInterface << std::endl;
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -2606,7 +2607,7 @@ class G1Deploy {
 #endif
 
       if (create_zmq) {
-        auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic);
+        auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic, zmq_out_host);
         std::cout << "Initialized ZMQ output interface" << std::endl;
         // Publish robot config so subscribers can receive it before control loop starts
         zmq_handler->publish_config();
@@ -4000,6 +4001,8 @@ class G1Deploy {
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
+    // Prospective first CONTROL input: copy logger history, append one live sample.
+    // This does not log a state, run a policy or touch motor_command_buffer_.
     // Passive capture of the exact already-built observation, before ordinary inference.
     // This callback never changes mode, history, token or motor buffers.
     void EmitPlannerDecodeSnapshot() {
@@ -4528,10 +4531,19 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  int ddsDomain = 0;
+  std::string zmqOutHost = "*";
   bool enableDex1Heartbeat = false;
   MotorGainScaleConfig motor_gain_scales;
   for (int i = 4; i < argc; i++) {
-    if (std::string(argv[i]) == "--enable-dex1-heartbeat") {
+    if (std::string(argv[i]) == "--dds-domain") {
+      if (i+1 >= argc) { std::cerr << "Missing DDS domain"; return 1; }
+      ddsDomain = std::stoi(argv[++i]);
+      if (ddsDomain < 0 || ddsDomain > 232) { std::cerr << "Invalid DDS domain"; return 1; }
+    } else if (std::string(argv[i]) == "--zmq-out-host") {
+      if (i+1 >= argc) { std::cerr << "Missing output host"; return 1; }
+      zmqOutHost = argv[++i];
+    } else if (std::string(argv[i]) == "--enable-dex1-heartbeat") {
       enableDex1Heartbeat = true;
     } else if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4807,7 +4819,7 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales, enableDex1Heartbeat
+    motor_gain_scales, enableDex1Heartbeat, ddsDomain, zmqOutHost
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
