@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <random>
@@ -25,6 +26,10 @@ public:
  Json receipt;
  double ready_time=0;
  static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+ static void validate_environment(const Json& c,int domain,const std::string& interface){
+  if(c.value("simulation_only",false) && (domain!=38 || interface!="lo" || std::getenv("CYCLONEDDS_URI")))
+   throw std::runtime_error("simulation-only single-step requires DDS domain 38, lo, and no CYCLONEDDS_URI override");
+ }
  explicit SingleStepEndpoint(const std::string& config){
   std::ifstream f(config);Json c;f>>c;
   if(c.at("followup")!="planner"||c.at("units")!="rad"||c.at("joint_order")!="hardware_29")throw std::runtime_error("single-step config must specify planner, rad, hardware_29");

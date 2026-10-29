@@ -12,7 +12,10 @@ def rpc(ctx, request):
     s.connect('tcp://127.0.0.1:15558')
     try:
         s.send_json(request)
-        if not s.poll(2000):raise TimeoutError('No reply; execution outcome unknown. Query the same request ID; do not resend with a new ID.')
+        if not s.poll(2000):
+            if request.get('op')=='status' and 'request_id' not in request:
+                raise TimeoutError('Status endpoint 15558 did not reply; this invocation sent NO execution request.')
+            raise TimeoutError('No reply; execution outcome unknown. Query the same request ID; do not resend with a new ID.')
         reply=s.recv_json()
         if not reply.get('ok'):raise RuntimeError(reply.get('error','request rejected'))
         return reply

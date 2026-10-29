@@ -2235,6 +2235,11 @@ class G1Deploy {
       
       enable_dex1_heartbeat_ = enable_dex1_heartbeat;
       // Initialize ChannelFactory
+      // Reject simulation-only endpoint configurations before creating DDS entities.
+      if(const char* config=std::getenv("SONIC_SINGLE_STEP_CONFIG")) {
+        std::ifstream f(config);nlohmann::json c;f>>c;
+        SingleStepEndpoint::validate_environment(c,dds_domain,networkInterface);
+      }
       ChannelFactory::Instance()->Init(dds_domain, networkInterface);
       std::cout << "[DDS] domain=" << dds_domain << " interface=" << networkInterface << std::endl;
 

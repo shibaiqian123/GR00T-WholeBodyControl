@@ -8,6 +8,14 @@ int main(){
  // Synthetic protocol fixture only. These are NOT physical robot limits.
  J c={{"port",15558},{"followup","planner"},{"units","rad"},{"joint_order","hardware_29"},{"constraint_source","synthetic test only"},{"q_min",std::vector<double>(29,-10)},{"q_max",std::vector<double>(29,10)},{"max_delta",std::vector<double>(29,1)}};
  std::string path="/tmp/single-step-test-"+std::to_string(getpid())+".json";{std::ofstream f(path);f<<c;}
+ unsetenv("CYCLONEDDS_URI");
+ J simulation=c;simulation["simulation_only"]=true;
+ E::validate_environment(simulation,38,"lo");
+ for(auto domain:{0,1,37}){bool rejected=false;try{E::validate_environment(simulation,domain,"lo");}catch(...){rejected=true;}assert(rejected);}
+ {bool rejected=false;try{E::validate_environment(simulation,38,"eth0");}catch(...){rejected=true;}assert(rejected);}
+ setenv("CYCLONEDDS_URI","override",1);
+ {bool rejected=false;try{E::validate_environment(simulation,38,"lo");}catch(...){rejected=true;}assert(rejected);}
+ unsetenv("CYCLONEDDS_URI");
  E e(path);std::remove(path.c_str());
  zmq::context_t ctx;zmq::socket_t client(ctx,zmq::socket_type::req);client.set(zmq::sockopt::rcvtimeo,1000);client.set(zmq::sockopt::linger,0);client.connect("tcp://127.0.0.1:15558");
  client.send(zmq::buffer(std::string("{\"op\":\"status\"}")),zmq::send_flags::none);zmq::message_t reply;assert(client.recv(reply));assert(J::parse(reply.to_string())["ready"]==false);
