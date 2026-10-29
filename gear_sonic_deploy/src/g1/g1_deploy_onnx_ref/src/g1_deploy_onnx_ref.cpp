@@ -2,7 +2,7 @@
 #include "readonly_decode_snapshot.hpp"
 #include "single_step_endpoint.hpp"
 #include "joint_target_limiter.hpp"
-#include "arm_target_smoother.hpp"
+#include "joint_target_smoother.hpp"
 #include "vibe_hybrid.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
@@ -308,7 +308,7 @@ class G1Deploy {
     MotorGainScaleConfig motor_gain_scales_;
     std::unique_ptr<SingleStepEndpoint> single_step_;
     std::unique_ptr<JointTargetLimiter> joint_target_limiter_;
-    std::unique_ptr<ArmTargetSmoother> arm_target_smoother_;
+    std::unique_ptr<JointTargetSmoother> target_smoother_;
     DataBuffer<MotorCommand> last_published_motor_command_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
@@ -2253,14 +2253,15 @@ class G1Deploy {
         joint_target_limiter_=std::make_unique<JointTargetLimiter>(c);
         std::cout << "[JointTargetLimiter] enabled for all normal CONTROL targets; source=" << c.at("constraint_source") << std::endl;
       }
-      if(const char* config=std::getenv("SONIC_ARM_TARGET_SMOOTHING")) {
+      if(std::getenv("SONIC_ARM_TARGET_SMOOTHING"))throw std::runtime_error("old arm-only smoothing retired; use SONIC_TARGET_SMOOTHING schema_version=2");
+      if(const char* config=std::getenv("SONIC_TARGET_SMOOTHING")) {
         if(joint_target_limiter_ || std::getenv("SONIC_SINGLE_STEP_CONFIG") || !vibe_hybrid_endpoint.empty())
           throw std::runtime_error("arm smoothing incompatible with full-body limiter, single-step or hybrid");
         std::ifstream f(config);nlohmann::json c;f>>c;
         SingleStepEndpoint::validate_environment(c,dds_domain,networkInterface);
-        arm_target_smoother_=std::make_unique<ArmTargetSmoother>(c);
+        target_smoother_=std::make_unique<JointTargetSmoother>(c);
         if(!startup_audit::writer().enabled())throw std::runtime_error("arm smoothing requires startup audit");
-        std::cout << "[ArmTargetSmoother] shoulders/elbows only (experimental): T_blend=" << arm_target_smoother_->blend_time << " tau=" << arm_target_smoother_->tau << " v_max=" << arm_target_smoother_->velocity << std::endl;
+        std::cout << "[JointTargetSmoother] full-body takeover + per-joint filtering (experimental): T_blend=" << target_smoother_->blend_time << std::endl;
       }
       ChannelFactory::Instance()->Init(dds_domain, networkInterface);
       std::cout << "[DDS] domain=" << dds_domain << " interface=" << networkInterface << std::endl;
@@ -2757,7 +2758,7 @@ class G1Deploy {
 
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
       if (mc) {
-        if(arm_target_smoother_ && operator_state.stop) {
+        if(target_smoother_ && operator_state.stop) {
           for(auto kp:mc->kp)if(kp!=0)return; // STOP bypasses shaping; only damping passes.
         }
         if(single_step_) {
@@ -2803,13 +2804,13 @@ class G1Deploy {
         bool write_ok=false;
         try {write_ok=lowcmd_publisher_->Write(dds_low_command);}
         catch(const std::exception& e) {
-          if(arm_target_smoother_){operator_state.stop=true;std::cerr<<"[ArmTargetSmoother] DDS exception: "<<e.what()<<std::endl;return;}
+          if(target_smoother_){operator_state.stop=true;std::cerr<<"[JointTargetSmoother] DDS exception: "<<e.what()<<std::endl;return;}
           if(!single_step_)throw;
           single_step_->fail(std::string("DDS write exception: ")+e.what());operator_state.stop=true;return;
         }
-        if(arm_target_smoother_) {
+        if(target_smoother_) {
           if(write_ok)last_published_motor_command_.SetData(*mc);
-          else {operator_state.stop=true;std::cerr<<"[ArmTargetSmoother] DDS publication failed"<<std::endl;return;}
+          else {operator_state.stop=true;std::cerr<<"[JointTargetSmoother] DDS publication failed"<<std::endl;return;}
         }
         if(single_step_) {
           auto& step=*single_step_;
@@ -2875,7 +2876,7 @@ class G1Deploy {
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
-      if(arm_target_smoother_)arm_target_smoother_->reset();
+      if(target_smoother_)target_smoother_->reset();
       if(joint_target_limiter_)joint_target_limiter_->reset();
       auto low_state_data = vibe_hybrid_endpoint.empty() ? low_state_buffer_.GetDataWithTime() : hybrid_snapshot_;
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
@@ -3355,7 +3356,7 @@ class G1Deploy {
         if(ls){std::array<double,29> q{},dq{};for(int i=0;i<29;++i){q[i]=ls->motor_state()[i].q();dq[i]=ls->motor_state()[i].dq();}r.array("actual_q",q).array("actual_dq",dq).array("imu_quaternion",ls->imu_state().quaternion()).array("imu_gyro",ls->imu_state().gyroscope());}
         startup_audit::writer().send(r);
       }
-      if(arm_target_smoother_) {
+      if(target_smoother_) {
         if(operator_state.stop)return false;
         try {
           const auto sent=last_published_motor_command_.GetDataWithTime();
@@ -3363,18 +3364,18 @@ class G1Deploy {
             throw std::runtime_error("no fresh successfully published motor target");
           if(!used_low_state_data_.data || used_low_state_data_.GetAgeMs()<0 || used_low_state_data_.GetAgeMs()>LOW_STATE_LATE_THRESHOLD.count())
             throw std::runtime_error("no fresh body feedback for smoothing");
-          ArmTargetSmoother::Vec raw{},seed{};
-          for(int i=0;i<29;++i){raw[i]=motor_command_tmp.q_target[i];seed[i]=sent.data->q_target[i];}
-          const auto filtered=arm_target_smoother_->apply(raw,seed,is_using_encoder_,SingleStepEndpoint::now(),control_dt_);
+          JointTargetSmoother::Vec raw{},seed{},measured{};
+          for(int i=0;i<29;++i){raw[i]=motor_command_tmp.q_target[i];seed[i]=sent.data->q_target[i];measured[i]=used_low_state_data_.data->motor_state()[i].q();}
+          const auto filtered=target_smoother_->apply(raw,seed,measured,is_using_encoder_,SingleStepEndpoint::now(),control_dt_);
           for(int i=0;i<29;++i)motor_command_tmp.q_target[i]=static_cast<float>(filtered[i]);
-          startup_audit::Row row("arm_target_smoothed");
-          row.scalar("control_tick",logging_counter_).scalar("using_encoder",is_using_encoder_).scalar("active",arm_target_smoother_->active)
-             .scalar("reseeded",arm_target_smoother_->reseeded).scalar("dt",arm_target_smoother_->dt).scalar("elapsed",arm_target_smoother_->elapsed)
-             .scalar("alpha",arm_target_smoother_->alpha).scalar("blend_weight",arm_target_smoother_->weight)
-             .array("raw_target",raw).array("last_published_target",seed).array("smoothed_target",motor_command_tmp.q_target);
+          startup_audit::Row row("joint_target_smoothed");
+          row.scalar("control_tick",logging_counter_).scalar("using_encoder",is_using_encoder_).scalar("active",target_smoother_->active)
+             .scalar("reseeded",target_smoother_->reseeded).scalar("dt",target_smoother_->dt).scalar("elapsed",target_smoother_->elapsed)
+             .array("alpha",target_smoother_->alpha).scalar("blend_weight",target_smoother_->weight)
+             .array("raw_target",raw).array("last_published_target",seed).array("actual_q",measured).array("smoothed_target",motor_command_tmp.q_target);
           startup_audit::writer().send(row);
         } catch(const std::exception& e) {
-          std::cerr<<"[ArmTargetSmoother] STOP: "<<e.what()<<std::endl;operator_state.stop=true;return false;
+          std::cerr<<"[JointTargetSmoother] STOP: "<<e.what()<<std::endl;operator_state.stop=true;return false;
         }
       }
       if(joint_target_limiter_) {
@@ -3397,7 +3398,7 @@ class G1Deploy {
         }
       }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
-      if((joint_target_limiter_ || arm_target_smoother_) && operator_state.stop)return false;
+      if((joint_target_limiter_ || target_smoother_) && operator_state.stop)return false;
       if(single_step_ && operator_state.stop){single_step_->cancel();return false;}
       motor_command_buffer_.SetData(motor_command_tmp);
       if(single_step_&&(single_decode||single_return)) {
