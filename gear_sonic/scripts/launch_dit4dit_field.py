@@ -19,9 +19,11 @@ p.add_argument('--inference-mode',choices=('async','sync'),default='async')
 p.add_argument('--segment-frames',type=int,default=10)
 p.add_argument('--joint-target-limits',type=Path,default=os.environ.get('SONIC_JOINT_TARGET_LIMITS'),help='Explicit continuous 29-joint limiter JSON; defaults to caller SONIC_JOINT_TARGET_LIMITS, otherwise disabled')
 p.add_argument('--arm-target-smoothing',type=Path,default=os.environ.get('SONIC_ARM_TARGET_SMOOTHING'),help='Experimental shoulder/elbow blend + lowpass + slew-limit JSON, disabled by default')
+p.add_argument('--target-smoothing',type=Path,default=os.environ.get('SONIC_TARGET_SMOOTHING'),help='Schema-v2 full-body takeover with per-joint optional filters and required tracking-error limits')
 p.add_argument('--dry-run',action='store_true')
 p.add_argument('--no-attach',action='store_true')
 a=p.parse_args()
+if a.arm_target_smoothing is not None:p.error("arm-only smoothing retired; use --target-smoothing with schema_version=2 and verified tracking limits")
 if not 1<=a.segment_frames<=50:p.error("--segment-frames must be 1..50")
 if a.inference_mode=="sync" and a.segment_frames==50:p.error("50 frames exceed the unchanged action horizon once inference takes time")
 if not a.session or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in a.session):p.error('Invalid session name')
@@ -55,43 +57,48 @@ if a.joint_target_limits is not None:
         p.error('joint target limiter: '+str(e))
 arm_config=None
 arm_source=None
-if a.arm_target_smoothing is not None:
+if a.target_smoothing is not None:
     try:
-        if limiter_config is not None:raise ValueError('choose arm smoothing OR full-body target limiter, not both')
-        arm_source=a.arm_target_smoothing.expanduser().resolve(strict=True)
+        if limiter_config is not None:raise ValueError('choose target smoothing OR full-body rate limiter, not both')
+        arm_source=a.target_smoothing.expanduser().resolve(strict=True)
         arm_config=json.loads(arm_source.read_text())
+        if arm_config.get('schema_version')!=2:raise ValueError('schema_version=2 required')
         if arm_config.get('simulation_only') is not False:raise ValueError('real-robot launcher requires simulation_only=false')
         if arm_config.get('units')!='rad' or arm_config.get('joint_order')!='hardware_29':raise ValueError('rad hardware_29 required')
-        for key in ('T_blend','tau','v_max'):
-            value=arm_config.get(key)
-            if type(value) not in (int,float) or not math.isfinite(value) or value<=0:raise ValueError(key+' must be finite and positive')
-        for key in ('q_min','q_max'):
+        source=arm_config.get('tracking_error_source')
+        if not isinstance(source,str) or not source.strip():raise ValueError('tracking_error_source required; draft configuration cannot start')
+        value=arm_config.get('T_blend')
+        if type(value) not in (int,float) or not math.isfinite(value) or value<=0:raise ValueError('T_blend must be finite and positive')
+        for key in ('q_min','q_max','tau','max_start_tracking_error'):
             values=arm_config.get(key)
-            if not isinstance(values,list) or len(values)!=29 or any(type(v) not in (int,float) or not math.isfinite(v) for v in values):raise ValueError(key+' needs 29 finite values')
-        indices=(15,16,17,18,22,23,24,25)
-        expected=[side+'_'+joint+'_joint' for side in ('left','right') for joint in ('shoulder_pitch','shoulder_roll','shoulder_yaw','elbow')]
-        names=arm_config.get('joint_names',[])
-        if len(names)!=29 or [names[i] for i in indices]!=expected:raise ValueError('shoulder/elbow mapping mismatch')
-        if any(arm_config['q_min'][i]>=arm_config['q_max'][i] for i in indices):raise ValueError('invalid arm position bounds')
-        if os.environ.get('SONIC_SINGLE_STEP_CONFIG') or os.environ.get('VIBE_HYBRID_ENDPOINT'):raise ValueError('arm smoothing incompatible with single-step/hybrid')
+            if not isinstance(values,list) or len(values)!=29 or any(type(v) not in (int,float) or not math.isfinite(v) for v in values):raise ValueError(key+' needs 29 finite values; unset draft entries cannot run')
+        rates=arm_config.get('v_max')
+        if not isinstance(rates,list) or len(rates)!=29 or any(v is not None and (type(v) not in (int,float) or not math.isfinite(v) or v<=0) for v in rates):raise ValueError('v_max needs 29 positive finite numbers or null (disabled)')
+        expected=[side+'_'+joint+'_joint' for side in ('left','right') for joint in ('hip_pitch','hip_roll','hip_yaw','knee','ankle_pitch','ankle_roll')]
+        expected += ['waist_'+joint+'_joint' for joint in ('yaw','roll','pitch')]
+        expected += [side+'_'+joint+'_joint' for side in ('left','right') for joint in ('shoulder_pitch','shoulder_roll','shoulder_yaw','elbow','wrist_roll','wrist_pitch','wrist_yaw')]
+        if arm_config.get('joint_names')!=expected:raise ValueError('full-body joint mapping mismatch')
+        for i in range(29):
+            if arm_config['q_min'][i]>=arm_config['q_max'][i] or arm_config['tau'][i]<0 or arm_config['max_start_tracking_error'][i]<=0:raise ValueError('invalid per-joint parameters at '+str(i))
+        if os.environ.get('SONIC_SINGLE_STEP_CONFIG') or os.environ.get('VIBE_HYBRID_ENDPOINT'):raise ValueError('target smoothing incompatible with single-step/hybrid')
     except (OSError,ValueError,TypeError,AttributeError) as e:
-        p.error('arm target smoothing: '+str(e))
+        p.error('target smoothing: '+str(e))
 # Use a validated per-run copy; preserve the exact configuration with the logs.
 limiter_run_path=out/'joint_target_limits.json'
-bottom_env=['env','-u','SONIC_JOINT_TARGET_LIMITS','-u','SONIC_ARM_TARGET_SMOOTHING']
+bottom_env=['env','-u','SONIC_JOINT_TARGET_LIMITS','-u','SONIC_ARM_TARGET_SMOOTHING','-u','SONIC_TARGET_SMOOTHING']
 if limiter_config is not None:
     bottom_env += ['SONIC_JOINT_TARGET_LIMITS='+str(limiter_run_path),
                    'SONIC_STARTUP_AUDIT='+str(out/'bottom_target_audit.jsonl')]
     print('JOINT TARGET LIMITER: enabled; config='+str(limiter_source)+'; validation checks format only, not hardware safety')
 else:
     print('JOINT TARGET LIMITER: disabled (explicitly clears inherited tmux setting)')
-arm_run_path=out/'arm_target_smoothing.json'
+arm_run_path=out/'joint_target_smoothing.json'
 if arm_config is not None:
-    bottom_env += ['SONIC_ARM_TARGET_SMOOTHING='+str(arm_run_path),
+    bottom_env += ['SONIC_TARGET_SMOOTHING='+str(arm_run_path),
                    'SONIC_STARTUP_AUDIT='+str(out/'bottom_target_audit.jsonl')]
-    print('ARM TARGET SMOOTHING: enabled (experimental); T_blend='+str(arm_config['T_blend'])+' tau='+str(arm_config['tau'])+' v_max='+str(arm_config['v_max'])+'; shoulders/elbows only; no token filtering')
+    print('TARGET SMOOTHING: full-body common takeover (experimental); T_blend='+str(arm_config['T_blend'])+'; per-joint filters; no token filtering')
 else:
-    print('ARM TARGET SMOOTHING: disabled')
+    print('TARGET SMOOTHING: disabled')
 commands=[
  ('bottom','cd '+shlex.quote(str(root/'gear_sonic_deploy'))+' && '+shlex.join(bottom_env+['./deploy.sh','--cp','policy/sonic_v1_1/model','--obs-config','policy/sonic_v1_1/observation_config.yaml','--input-type','zmq_manager','--motor-kp-scale','4,10=1.5','--motor-kd-scale','4,10=1.5','--enable-dex1-heartbeat',a.interface])),
  ('observations',shlex.join([tele,'-u','-m','gear_sonic.scripts.run_model_observers','--interface',a.interface])),
@@ -120,7 +127,7 @@ if limiter_config is not None:
     (out/'joint_target_limits_source.json').write_text(json.dumps(dict(source=str(limiter_source),saved_sha256=hashlib.sha256(limiter_run_path.read_bytes()).hexdigest()),indent=2))
 if arm_config is not None:
     arm_run_path.write_text(json.dumps(arm_config,indent=2,allow_nan=False)+'\n')
-    (out/'arm_target_smoothing_source.json').write_text(json.dumps(dict(source=str(arm_source),saved_sha256=hashlib.sha256(arm_run_path.read_bytes()).hexdigest()),indent=2))
+    (out/'joint_target_smoothing_source.json').write_text(json.dumps(dict(source=str(arm_source),saved_sha256=hashlib.sha256(arm_run_path.read_bytes()).hexdigest()),indent=2))
 def tm(*args):
     return subprocess.check_output(['tmux',*args],text=True).strip()
 # Build the complete layout before starting any control process.
