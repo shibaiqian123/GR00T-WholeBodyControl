@@ -1,5 +1,6 @@
 #include "startup_audit.hpp"
 #include "readonly_decode_snapshot.hpp"
+#include "single_step_endpoint.hpp"
 #include "vibe_hybrid.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
@@ -303,6 +304,7 @@ class G1Deploy {
     ProgramState program_state_;
     bool enable_dex1_heartbeat_ = false;
     MotorGainScaleConfig motor_gain_scales_;
+    std::unique_ptr<SingleStepEndpoint> single_step_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
@@ -2627,6 +2629,15 @@ class G1Deploy {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
 
+      // Explicit opt-in only. The endpoint never starts control or enables planner.
+      if(const char* config=std::getenv("SONIC_SINGLE_STEP_CONFIG")) {
+        if(!planner_ || !vibe_hybrid_endpoint.empty()) throw std::runtime_error("single-step requires local SONIC planner");
+        if(!startup_audit::writer().enabled())throw std::runtime_error("single-step requires SONIC_STARTUP_AUDIT log");
+        const std::vector<std::string> expected={"token_state","his_base_angular_velocity_10frame_step1","his_body_joint_positions_10frame_step1","his_body_joint_velocities_10frame_step1","his_last_actions_10frame_step1","his_gravity_dir_10frame_step1"};
+        std::vector<std::string> enabled;for(const auto& c:obs_config_)if(c.enabled)enabled.push_back(c.name);
+        if(enabled!=expected || obs_buffer_.size()!=994)throw std::runtime_error("single-step requires exact SONIC v1.1 observation layout");
+        single_step_=std::make_unique<SingleStepEndpoint>(config);
+      }
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
@@ -2710,12 +2721,30 @@ class G1Deploy {
      * Also publishes Dex3 hand commands at the same cadence.
      */
     void LowCommandWriter() {
+      std::unique_lock<std::mutex> single_lock;
+      if(single_step_)single_lock=std::unique_lock<std::mutex>(single_step_->mutex);
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
       if (mc) {
+        if(single_step_) {
+          if(operator_state.stop || single_step_->stopped) {
+            single_step_->cancel();
+            // Only the existing damping command may pass after stop.
+            for(auto kp:mc->kp)if(kp!=0)return;
+          }
+          if(single_step_->phase=="token_pending" || single_step_->phase=="planner_pending") {
+            if(!planner_ || !planner_->planner_state_.enabled || !planner_->planner_state_.initialized ||
+               current_motion_!=planner_motion_ || !used_low_state_data_.data ||
+               used_low_state_data_.GetAgeMs()<0 || used_low_state_data_.GetAgeMs()>LOW_STATE_LATE_THRESHOLD.count()) {
+              single_step_->fail("planner/feedback changed before DDS write");operator_state.stop=true;return;
+            }
+          }
+          // Do not repeat the one-shot motor frame while waiting for planner.
+          if(!single_step_->write_allowed())return;
+        }
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
           dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
@@ -2735,7 +2764,27 @@ class G1Deploy {
         if(startup_audit::writer().enabled()) {
           startup_audit::Row r("dds_write_attempt");r.array("q",mc->q_target).array("dq",mc->dq_target).array("kp",mc->kp).array("kd",mc->kd).array("tau",mc->tau_ff);startup_audit::writer().send(r);
         }
-        lowcmd_publisher_->Write(dds_low_command);
+        if(single_step_&&single_step_->phase=="token_pending") {
+          single_step_->receipt["dds_write_attempts"]=1;
+          single_step_->receipt["dds_write_time"]=SingleStepEndpoint::now();
+          single_step_->receipt["dds_target"]=mc->q_target;single_step_->save();
+        }
+        bool write_ok=false;
+        try {write_ok=lowcmd_publisher_->Write(dds_low_command);}
+        catch(const std::exception& e) {
+          if(!single_step_)throw;
+          single_step_->fail(std::string("DDS write exception: ")+e.what());operator_state.stop=true;return;
+        }
+        if(single_step_) {
+          auto& step=*single_step_;
+          if(step.phase=="token_pending") {
+            step.receipt["dds_target"]=mc->q_target;step.token_write_result(write_ok);
+            if(!write_ok)operator_state.stop=true;
+          }else if(step.phase=="planner_pending") {
+            step.planner_write_result(write_ok);if(!write_ok)operator_state.stop=true;
+          }
+
+        }
       }
 
       // Publish Dex3 hand commands at the same publish cadence
@@ -3182,15 +3231,34 @@ class G1Deploy {
         }
       }
 
+      std::unique_lock<std::mutex> single_lock;
+      bool single_decode=false, single_return=false;
+      if(single_step_) {
+        single_lock=std::unique_lock<std::mutex>(single_step_->mutex);
+        auto& step=*single_step_;
+        const bool planner_ok=program_state_==ProgramState::CONTROL && planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized && current_motion_==planner_motion_ && is_using_encoder_ && used_low_state_data_.data && used_low_state_data_.GetAgeMs()>=0 && used_low_state_data_.GetAgeMs()<=LOW_STATE_LATE_THRESHOLD.count();
+        step.update_ready(planner_ok&&!operator_state.stop);
+        if(operator_state.stop || step.stopped){step.cancel();operator_state.stop=true;return false;}
+        if(step.phase=="token_pending" || step.phase=="planner_pending") {step.fail("previous one-shot write not acknowledged before next control cycle");operator_state.stop=true;return false;}
+        single_decode=step.phase=="accepted";single_return=step.phase=="token_written";
+        if((single_decode||single_return)&&!planner_ok){step.fail("planner eligibility lost");operator_state.stop=true;return false;}
+        if(single_decode){step.phase="decoding";step.receipt["phase"]=step.phase;step.receipt["decode_count"]=1;step.receipt["decode_time"]=SingleStepEndpoint::now();step.save();}
+      }
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
         obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]); 
       }
 
+      if(single_decode) {
+        for(size_t i=0;i<64;++i)obs_buffer_float[i]=static_cast<float>(single_step_->token[i]);
+        single_step_->receipt["decoder_input"]=obs_buffer_float;
+        single_step_->receipt["source_tick"]=used_low_state_data_.data->tick();
+      }
       std::array<double,29> audit_previous_action=last_action;
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
       if (!policy_engine_->Infer()) {
+        if(single_step_&&(single_decode||single_return))single_step_->fail("decoder inference failed");
         std::cerr << "✗ Error: Control policy inference failed" << std::endl;
         return false;
       }
@@ -3209,6 +3277,23 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      if(single_step_ && (single_decode||single_return)) {
+        auto& step=*single_step_;std::array<double,29> q{},actual{};
+        for(int i=0;i<29;++i){q[i]=motor_command_tmp.q_target[i];actual[i]=used_low_state_data_.data->motor_state()[i].q();}
+        startup_audit::Row decoded_row("single_step_decoded");
+        decoded_row.text("request_id",step.active).scalar("planner_return",single_return).scalar("source_tick",used_low_state_data_.data->tick())
+          .array("decoder_input",obs_buffer_float).array("raw_action",action_buffer).array("target",q).array("actual_q",actual)
+          .array("mapping",isaaclab_to_mujoco).array("scale",g1_action_scale).array("default_angles",default_angles);
+        startup_audit::writer().send(decoded_row);
+        const std::string prefix=single_decode?"":"planner_";
+        if(single_return) {
+          const auto prior=SingleStepEndpoint::finite_array<29>(step.receipt.at("target"));
+          if(!step.within_limits(q,prior)){step.fail("planner return target discontinuity exceeds configured envelope");operator_state.stop=true;return false;}
+        }
+        step.receipt[prefix+"raw_action"]=action_buffer;step.receipt[prefix+"target"]=q;step.receipt[prefix+"actual_q"]=actual;
+        step.receipt["mapping"]=isaaclab_to_mujoco;step.receipt["scale"]=g1_action_scale;step.receipt["default_angles"]=default_angles;
+        if(!step.within_limits(q,actual)){step.fail(prefix+"target outside configured position/delta envelope");operator_state.stop=true;return false;}
+      }
       if (!vibe_hybrid_endpoint.empty()) {
         try {
           if(!hybrid_client_) hybrid_client_=std::make_unique<VibeHybridClient>(vibe_hybrid_endpoint);
@@ -3221,8 +3306,11 @@ class G1Deploy {
       }
       if(startup_audit::writer().enabled()) {
         startup_audit::Row r("decoder_command");
-        r.scalar("control_tick",logging_counter_).array("decoder_input",obs_buffer_float)
-         .array("token",token_state_data_).array("previous_action",audit_previous_action)
+        std::vector<double> audit_token(token_state_data_.begin(),token_state_data_.end());
+        if(single_decode)audit_token.assign(single_step_->token.begin(),single_step_->token.end());
+        if(single_step_&&(single_decode||single_return))r.text("single_step_request_id",single_step_->active);
+        r.scalar("single_step",single_decode).scalar("single_step_return",single_return).scalar("control_tick",logging_counter_).scalar("using_encoder",is_using_encoder_).scalar("reference_frame",current_frame_).text("reference_motion",current_motion_->name).array("decoder_input",obs_buffer_float)
+         .array("token",audit_token).array("previous_action",audit_previous_action)
          .array("raw_action",action_buffer).array("joint_target",motor_command_tmp.q_target)
          .array("mapping",isaaclab_to_mujoco).array("scale",g1_action_scale).array("default_angles",default_angles);
         const auto ls=used_low_state_data_.data;
@@ -3230,7 +3318,12 @@ class G1Deploy {
         startup_audit::writer().send(r);
       }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
+      if(single_step_ && operator_state.stop){single_step_->cancel();return false;}
       motor_command_buffer_.SetData(motor_command_tmp);
+      if(single_step_&&(single_decode||single_return)) {
+        single_step_->phase=single_decode?"token_pending":"planner_pending";
+        single_step_->receipt["phase"]=single_step_->phase;single_step_->save();
+      }
       return true;
     }
 
@@ -3513,6 +3606,8 @@ class G1Deploy {
      * 4. Optionally records / plays back input state for offline replay.
      */
     void Input() {
+      std::unique_lock<std::mutex> single_input_lock;
+      if(single_step_)single_input_lock=std::unique_lock<std::mutex>(single_step_->mutex);
       if (operator_state.stop) { return; }
       
       // Update input interface (poll for new data)
