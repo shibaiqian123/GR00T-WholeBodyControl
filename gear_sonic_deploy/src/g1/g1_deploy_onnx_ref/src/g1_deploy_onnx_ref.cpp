@@ -1,4 +1,5 @@
 #include "startup_audit.hpp"
+#include "readonly_decode_snapshot.hpp"
 #include "vibe_hybrid.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
@@ -3904,6 +3905,75 @@ class G1Deploy {
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
+    // Passive capture of the exact already-built observation, before ordinary inference.
+    // This callback never changes mode, history, token or motor buffers.
+    void EmitPlannerDecodeSnapshot() {
+      if (!std::getenv("SONIC_READONLY_DECODE_SNAPSHOT") || !startup_audit::writer().enabled()) return;
+      if (operator_state.stop || program_state_ != ProgramState::CONTROL || !planner_ ||
+          !planner_->planner_state_.enabled || !planner_->planner_state_.initialized ||
+          current_motion_ != planner_motion_ || !is_using_encoder_) return;
+      const std::vector<std::string> expected={"token_state","his_base_angular_velocity_10frame_step1","his_body_joint_positions_10frame_step1","his_body_joint_velocities_10frame_step1","his_last_actions_10frame_step1","his_gravity_dir_10frame_step1"};
+      std::vector<std::string> enabled;
+      for(const auto& c:obs_config_)if(c.enabled)enabled.push_back(c.name);
+      if(enabled!=expected || obs_buffer_.size()!=994) return;
+      for(auto v:obs_buffer_)if(!std::isfinite(v))return;
+      const auto& sample=used_low_state_data_;
+      if(!sample.data || sample.GetAgeMs()<0 || sample.GetAgeMs()>250)return;
+      std::array<double,29> q{},dq{};
+      for(int i=0;i<29;++i){q[i]=sample.data->motor_state()[i].q();dq[i]=sample.data->motor_state()[i].dq();if(!std::isfinite(q[i])||!std::isfinite(dq[i]))return;}
+      startup_audit::Row row("readonly_decode_snapshot");
+      row.text("schema_name","sonic_v1_1_planner_observation_v1").text("state","CONTROL_PLANNER")
+        .text("stability","not_assessed").scalar("motor_written",false)
+        .scalar("pid",getpid()).scalar("source_tick",sample.data->tick()).scalar("control_tick",logging_counter_)
+        .scalar("sample_time",std::chrono::duration<double>(sample.timestamp.time_since_epoch()).count())
+        .array("decoder_input",obs_buffer_).array("actual_q",q).array("actual_dq",dq)
+        .array("imu_quaternion",sample.data->imu_state().quaternion()).array("imu_gyro",sample.data->imu_state().gyroscope())
+        .scalar("reference_frame",current_frame_).text("reference_motion",current_motion_->name)
+        .array("mapping",isaaclab_to_mujoco).array("scale",g1_action_scale).array("default_angles",default_angles);
+      startup_audit::writer().send(row);
+    }
+
+    void EmitReadonlyDecodeSnapshot() {
+      if (!std::getenv("SONIC_READONLY_DECODE_SNAPSHOT") || !startup_audit::writer().enabled()) return;
+      if (operator_state.stop || operator_state.start || program_state_ != ProgramState::WAIT_FOR_CONTROL) return;
+      const std::vector<std::string> expected={"token_state","his_base_angular_velocity_10frame_step1","his_body_joint_positions_10frame_step1","his_body_joint_velocities_10frame_step1","his_last_actions_10frame_step1","his_gravity_dir_10frame_step1"};
+      std::vector<std::string> enabled;
+      for(const auto& c:obs_config_)if(c.enabled)enabled.push_back(c.name);
+      if(enabled!=expected || !state_logger_ || control_dt_!=0.02) return;
+      const auto sample=low_state_buffer_.GetDataWithTime();
+      const auto torso=imu_torso_buffer_.GetDataWithTime();
+      if(!sample.data || !torso.data || sample.GetAgeMs()<0 || sample.GetAgeMs()>250 || torso.GetAgeMs()<0 || torso.GetAgeMs()>250)return;
+      try {
+        auto hist=state_logger_->GetLatest(9,control_dt_,false);
+        StateLogger::Entry current;
+        current.base_quat=float_to_double<4>(sample.data->imu_state().quaternion());
+        double norm=0;for(auto v:current.base_quat)norm+=v*v;
+        if(!std::isfinite(norm)||std::abs(norm-1)>0.01)return;
+        current.base_ang_vel=float_to_double<3>(sample.data->imu_state().gyroscope());
+        current.body_q.resize(29);current.body_dq.resize(29);
+        current.last_action.assign(last_action.begin(),last_action.end());
+        std::array<double,29> actual{},velocity{};
+        for(int i=0;i<29;++i){
+          actual[i]=sample.data->motor_state()[i].q();velocity[i]=sample.data->motor_state()[i].dq();
+          current.body_q[i]=sample.data->motor_state()[mujoco_to_isaaclab[i]].q()-default_angles[mujoco_to_isaaclab[i]];
+          current.body_dq[i]=sample.data->motor_state()[mujoco_to_isaaclab[i]].dq();
+        }
+        std::vector<int> padding;
+        for(size_t i=0;i<hist.size();++i)if(hist[i].timestamp==std::chrono::system_clock::time_point{})padding.push_back(static_cast<int>(i));
+        hist.push_back(current);
+        auto input=PackReadonlyDecodeSnapshot(hist,[](const auto& q){return quat_rotate_d(quat_conjugate_d(q),{0.0,0.0,-1.0});});
+        startup_audit::Row row("readonly_decode_snapshot");
+        row.text("schema_name","sonic_v1_1_prospective_control_v1").text("state","WAIT_FOR_CONTROL")
+          .scalar("pid",getpid()).scalar("source_tick",sample.data->tick()).scalar("motor_written",false)
+          .scalar("sample_time",std::chrono::duration<double>(sample.timestamp.time_since_epoch()).count())
+          .array("decoder_input",input).array("actual_q",actual).array("actual_dq",velocity)
+          .array("padding_rows",padding).array("mapping",isaaclab_to_mujoco).array("scale",g1_action_scale).array("default_angles",default_angles);
+        startup_audit::writer().send(row);
+      }catch(const std::exception& e){
+        startup_audit::Row row("readonly_decode_snapshot_error");row.text("error",e.what());startup_audit::writer().send(row);
+      }
+    }
+
     void Control() {
       if (!vibe_hybrid_endpoint.empty()) {
         auto snapshot=low_state_buffer_.GetDataWithTime();
@@ -3965,6 +4035,7 @@ class G1Deploy {
             break;
           }
 
+          EmitReadonlyDecodeSnapshot();
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
@@ -4089,6 +4160,7 @@ class G1Deploy {
 
           auto obs_end_time = std::chrono::steady_clock::now();
 
+          EmitPlannerDecodeSnapshot();
           if (!CreatePolicyCommand()) {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
