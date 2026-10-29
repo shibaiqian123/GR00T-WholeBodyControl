@@ -81,3 +81,6 @@ bash gear_sonic/scripts/launch_sim_single_step_bottom.sh。该命令创建独立
 ready=false或超限必须停下排查；不自动重试、不改限值。
 单帧之后仍按原实现返回PLANNER；不是INIT直接下发路径，不控制Dex1。
 初次status超时的文案现在明确说明本次调用没有发送执行请求。
+
+### PLANNER 启动锁修复
+启用单帧接口时，Input持事务锁调用ZMQManager；原同步等待planner_motion会阻塞同样需要该锁的控制线程，导致5秒启动超时。两处启动等待改为每Input周期检查后返回，保持5秒截止时间；外层键盘/网络stop和已锁存stop优先处理。新增带共享锁的等待回归测试。编译与单元测试不代表整机启动或实机验证通过。

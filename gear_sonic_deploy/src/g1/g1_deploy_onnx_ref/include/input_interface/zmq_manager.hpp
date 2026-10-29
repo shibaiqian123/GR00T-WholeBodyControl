@@ -55,6 +55,7 @@
 #include "input_interface.hpp"
 #include "input_command.hpp"
 #include "streamed_token_start.hpp"
+#include "planner_start_gate.hpp"
 #include "zmq_endpoint_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "../localmotion_kplanner.hpp"  // For LocomotionMode enum
@@ -478,6 +479,25 @@ class ZMQManager : public InputInterface {
                            DataBuffer<MovementState>& movement_state_buffer,
                            std::mutex& current_motion_mutex) {
       
+      // Never sleep while Input holds the single-step transaction mutex:
+      // CONTROL must acquire that mutex to advance to planner_motion.
+      if(planner_start_gate_.pending) {
+        bool motion_ready=false;
+        {std::lock_guard<std::mutex> lock(current_motion_mutex);
+         motion_ready=current_motion->name=="planner_motion";}
+        const auto result=planner_start_gate_.poll(planner_state.enabled,
+            planner_state.initialized,motion_ready,PlannerStartNow());
+        if(result==sonic::PlannerStartGate::Result::waiting)return;
+        if(result!=sonic::PlannerStartGate::Result::ready) {
+          std::cerr<<"[ZMQCommandManager ERROR] Planner initialization failed or exceeded unchanged 5s timeout"<<std::endl;
+          operator_state.stop=true;
+          return;
+        }
+        is_planner_ready_=true;
+        {std::lock_guard<std::mutex> lock(current_motion_mutex);operator_state.play=true;}
+        std::cout<<"[ZMQManager] PLANNER ready: planner_motion active"<<std::endl;
+      }
+
       // Handle safety reset from interface manager (same as GamepadManager)
       if (CheckAndClearSafetyReset()) {
         {
@@ -505,40 +525,8 @@ class ZMQManager : public InputInterface {
             planner_state.enabled = true;
             std::cout << "[ZMQManager] Planner enabled" << std::endl;
 
-            // Wait for planner to be initialized with timeout (5 seconds)
-            auto wait_start = std::chrono::steady_clock::now();
-            constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-            while (planner_state.enabled) {
-              {
-                std::lock_guard<std::mutex> lock(current_motion_mutex);
-                if (current_motion->name == "planner_motion") {
-                  break;
-                }
-              }
-              std::this_thread::sleep_for(std::chrono::milliseconds(100));
-              auto elapsed = std::chrono::steady_clock::now() - wait_start;
-              if (elapsed > PLANNER_INIT_TIMEOUT) {
-                std::cerr << "[ZMQCommandManager ERROR] Planner initialization timeout after 5 seconds" << std::endl;
-                operator_state.stop = true;
-                return;
-              }
-              std::cout << "[ZMQManager] Waiting for planner to be initialized" << std::endl;
-            }
-
-            // Check if planner is enabled and initialized
-            if (!planner_state.enabled || !planner_state.initialized) {
-              std::cerr << "[ZMQCommandManager ERROR] Planner failed to initialize. Stopping control." << std::endl;
-              operator_state.stop = true;
-              return;
-            }
-
-            is_planner_ready_ = true;
-
-            // Play motion
-            {
-              std::lock_guard<std::mutex> lock(current_motion_mutex);
-              operator_state.play = true;
-            }
+            planner_start_gate_.begin(PlannerStartNow());
+            return;
           }
         }
         return;
@@ -559,40 +547,8 @@ class ZMQManager : public InputInterface {
           std::cout << "[ZMQManager] Planner enabled" << std::endl;
         }
         
-        // Wait for initialization
-        auto wait_start = std::chrono::steady_clock::now();
-        constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-        while (planner_state.enabled) {
-          {
-            std::lock_guard<std::mutex> lock(current_motion_mutex);
-            if (current_motion->name == "planner_motion") {
-              std::cout << "[ZMQManager] motion name is planner_motion" << std::endl;
-              break;
-            }
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          auto elapsed = std::chrono::steady_clock::now() - wait_start;
-          if (elapsed > PLANNER_INIT_TIMEOUT) {
-            std::cerr << "[ZMQCommandManager ERROR] Planner initialization timeout" << std::endl;
-            operator_state.stop = true;
-            return;
-          }
-          std::cout << "[ZMQManager] Waiting for planner to be initialized" << std::endl;
-        }
-        
-        // Check if planner is enabled and initialized
-        if (!planner_state.enabled || !planner_state.initialized) {
-          std::cerr << "[ZMQCommandManager ERROR] Planner failed to initialize. Stopping control." << std::endl;
-          operator_state.stop = true;
-          return;
-        }
-        
-        is_planner_ready_ = true;
-
-        {
-          std::lock_guard<std::mutex> lock(current_motion_mutex);
-          operator_state.play = true;
-        }
+        planner_start_gate_.begin(PlannerStartNow());
+        return;
       }
 
       // Apply planner commands if planner is ready
@@ -1265,6 +1221,10 @@ class ZMQManager : public InputInterface {
     // ------------------------------------------------------------------
     bool emergency_stop_ = false;  ///< Set by 'O'/'o' keyboard shortcut.
     bool report_temperature_flag_ = false;  ///< Set by 'F'/'f' keyboard shortcut.
+    sonic::PlannerStartGate planner_start_gate_;
+    static double PlannerStartNow() {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     bool start_control_ = false;   ///< Start request from command message.
     bool stop_control_ = false;    ///< Stop request from command message.
 
