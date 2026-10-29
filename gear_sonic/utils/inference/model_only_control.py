@@ -36,8 +36,15 @@ class ModelControl:
                 raise ValueError('arm needs fresh sensors and bottom WAIT_FOR_CONTROL')
             self.mode='armed';self.reason='manual_hold_current_grippers';return
         if key=='model':
-            if self.mode!='armed' or not sensors or not dex_ready or not self.bottom_ok(now) or self.bottom['state']!='WAIT_FOR_CONTROL' or not self.chunk or not fresh(self.chunk[0],now,.5):
-                raise ValueError('Need arm, READY grippers, fresh prediction, sensors, WAIT_FOR_CONTROL')
+            failures=[]
+            if self.mode!='armed':failures.append('mode='+self.mode+' (need armed)')
+            if not sensors:failures.append('sensors invalid')
+            if not dex_ready:failures.append('grippers not READY')
+            if not self.bottom_ok(now):failures.append('bottom heartbeat invalid/stale')
+            if (self.bottom or {}).get('state')!='WAIT_FOR_CONTROL':failures.append('bottom not WAIT_FOR_CONTROL')
+            if self.chunk is None:failures.append('prediction missing')
+            elif not fresh(self.chunk[0],now,.5):failures.append('prediction age=%.3fs (need 0..0.500s)'%(now-self.chunk[0]))
+            if failures:raise ValueError('; '.join(failures))
             self.mode='starting';self.started=now;self.reason='prefill_real_token';return
         raise ValueError('Commands: arm, model, stop, recover, reset, quit')
     def accept(self,result,now):

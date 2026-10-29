@@ -1,3 +1,4 @@
+#include "startup_audit.hpp"
 #include "vibe_hybrid.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
@@ -571,6 +572,11 @@ class G1Deploy {
       if (current_motion_->GetNumBodyQuaternions() == 0) { return; }
       if (!state_logger_) { return; }
 
+      if (startup_audit::writer().enabled() && (reinitialize_heading_ || current_frame_ == 0)) {
+        startup_audit::Row r("heading_reference_update");
+        r.scalar("reinitialize",reinitialize_heading_).scalar("reference_frame",current_frame_).text("motion",current_motion_->name);
+        startup_audit::writer().send(r);
+      }
       if (reinitialize_heading_) {
         double sample_dt = control_dt_;
         auto hist = state_logger_->GetLatest(1, sample_dt);
@@ -2725,6 +2731,9 @@ class G1Deploy {
           dds_low_command.reserve()[3]=hybrid_fault_.load();
         }
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+        if(startup_audit::writer().enabled()) {
+          startup_audit::Row r("dds_write_attempt");r.array("q",mc->q_target).array("dq",mc->dq_target).array("kp",mc->kp).array("kd",mc->kd).array("tau",mc->tau_ff);startup_audit::writer().send(r);
+        }
         lowcmd_publisher_->Write(dds_low_command);
       }
 
@@ -3178,6 +3187,7 @@ class G1Deploy {
         obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]); 
       }
 
+      std::array<double,29> audit_previous_action=last_action;
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
       if (!policy_engine_->Infer()) {
         std::cerr << "✗ Error: Control policy inference failed" << std::endl;
@@ -3207,6 +3217,16 @@ class G1Deploy {
         } catch(const std::exception& e) {
           hybrid_fault_=1;std::cerr<<"HYBRID_STOP: "<<e.what()<<std::endl;return false;
         }
+      }
+      if(startup_audit::writer().enabled()) {
+        startup_audit::Row r("decoder_command");
+        r.scalar("control_tick",logging_counter_).array("decoder_input",obs_buffer_float)
+         .array("token",token_state_data_).array("previous_action",audit_previous_action)
+         .array("raw_action",action_buffer).array("joint_target",motor_command_tmp.q_target)
+         .array("mapping",isaaclab_to_mujoco).array("scale",g1_action_scale).array("default_angles",default_angles);
+        const auto ls=used_low_state_data_.data;
+        if(ls){std::array<double,29> q{},dq{};for(int i=0;i<29;++i){q[i]=ls->motor_state()[i].q();dq[i]=ls->motor_state()[i].dq();}r.array("actual_q",q).array("actual_dq",dq).array("imu_quaternion",ls->imu_state().quaternion()).array("imu_gyro",ls->imu_state().gyroscope());}
+        startup_audit::writer().send(r);
       }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -3920,6 +3940,13 @@ class G1Deploy {
       }
       if (operator_state.stop) { return; }
 
+      if (startup_audit::writer().enabled() && program_state_ == ProgramState::WAIT_FOR_CONTROL) {
+        startup_audit::Row r("waiting_state");
+        r.scalar("start_requested",operator_state.start).array("last_action",last_action);
+        const auto ls=low_state_buffer_.GetDataWithTime().data;
+        if(ls){std::array<double,29> q{},dq{};for(int i=0;i<29;++i){q[i]=ls->motor_state()[i].q();dq[i]=ls->motor_state()[i].dq();}r.array("actual_q",q).array("actual_dq",dq);}
+        startup_audit::writer().send(r);
+      }
       switch (program_state_) {
         case ProgramState::INIT:
           if (!InitControl()) {

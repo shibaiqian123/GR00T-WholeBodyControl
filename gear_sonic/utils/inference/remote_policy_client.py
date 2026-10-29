@@ -8,12 +8,36 @@ def bind_reply(req, reply, sent, received):
         raise ValueError('Mismatched inference response')
     reply = dict(reply)
     reply['observed_at'] = req['observed_at']
+    reply['preparation_seconds'] = req.get('preparation_seconds',0.)
     reply['roundtrip_seconds'] = received - sent
     reply['observation_age_seconds'] = received - req['observed_at']
     if not 0 <= reply['observation_age_seconds'] < .95:
         reply['ok'] = False
         reply['error'] = 'Prediction expired on client clock'
     return reply
+
+
+def prepare_request(request):
+    """Worker-only CPU/disk work. Archive raw input; transmit training-sized RGB."""
+    if '_input' not in request:
+        return request
+    import base64
+    import io
+    import numpy as np
+    from PIL import Image
+    started=time.monotonic()
+    req=dict(request)
+    raw=req.pop('_input')
+    path=req.pop('_input_path')
+    # This is the same RGB/BILINEAR preprocessing used by the policy server.
+    image=Image.fromarray(raw['image']).convert('RGB').resize((224,224),Image.Resampling.BILINEAR)
+    buf=io.BytesIO()
+    image.save(buf,format='PNG')
+    req['image_png']=base64.b64encode(buf.getvalue()).decode('ascii')
+    # Preserve original resolution and all timestamps; avoid costly ZIP compression.
+    np.savez(path,**raw)
+    req['preparation_seconds']=time.monotonic()-started
+    return req
 
 
 def worker(endpoint, requests, replies, done):
@@ -30,6 +54,8 @@ def worker(endpoint, requests, replies, done):
             sock.setsockopt(zmq.RECONNECT_IVL, 1000)
             sock.connect(endpoint)
             try:
+                if done.is_set():break
+                req = prepare_request(req)
                 sent = time.monotonic()
                 if not 0 <= sent - req['observed_at'] <= .5:
                     raise ValueError('Observation expired before send')

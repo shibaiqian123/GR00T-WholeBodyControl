@@ -86,3 +86,24 @@ ZMQManager在STREAMED_MOTION模式处理完pose输入后，将网络start传入o
 若停止优先或token缺失，会记录Start blocked或Start rejected。接收日志只能证明解析到请求，不能替代CONTROL心跳确认。
 
 测试覆盖启动/停止/token/既有启动状态的16种组合、token晚到不得自动启动、同帧停止优先。全程序编译用于检查集成，实机启动仍待现场验证。本次没有自动重启底层或发送model命令。此前bottom_stale是独立问题，不因这次启动补丁而认定解决。
+
+## 2026-10-28: asynchronous input preparation
+
+The model-only gateway copies observations into its bounded one-request queue.
+PNG encoding and input saving run in the inference worker, not the control loop.
+The worker applies the server's RGB/BILINEAR 224x224 preprocessing before lossless
+PNG transport; full-resolution inputs and original timestamps remain in NPZ.
+NPZ files now use uncompressed storage: lower CPU cost, greater disk usage.
+Preparation errors return inference errors; original freshness thresholds,
+generation checks, stop priority, and manual activation remain unchanged.
+
+Validation: 16 unit tests and five isolated transport scenarios passed.
+A 60-second parallel read-only run at outputs/async_readonly_20261028_203256
+returned 142 valid predictions with no motion frames. Preparation median 37.9ms;
+health-sampled loop gap median 20.07ms, P95 20.09ms (not a full 50Hz timing audit).
+Observation-to-response median 425ms, P95 524ms; 122/142 arrivals met 500ms.
+The existing gateway was still sharing the inference server. This verifies the
+control-loop improvement, not stable startup freshness or hardware acceptance.
+An exclusive read-only measurement is still needed after the operator safely
+stops the existing control session. Do not loosen freshness thresholds or
+activate motion automatically. Running processes must restart to load changes.

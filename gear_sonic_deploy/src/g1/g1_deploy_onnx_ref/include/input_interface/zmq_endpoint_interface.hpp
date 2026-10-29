@@ -1,3 +1,4 @@
+#include "startup_audit.hpp"
 /**
  * @file zmq_endpoint_interface.hpp
  * @brief ZMQ-based input interface for receiving streamed pose / motion data.
@@ -729,6 +730,11 @@ private:
                 return result;
             }
             
+            if (startup_audit::writer().enabled()) {
+                startup_audit::Row r("token_received");r.array("token",token_data);
+                if(frame_index_idx>=0){const auto& field=buffered_header_.fields[static_cast<size_t>(frame_index_idx)];const auto& bytes=buffered_buffers_[static_cast<size_t>(frame_index_idx)];if(field.dtype=="i64" && bytes.size()>=sizeof(int64_t)){int64_t frame;std::memcpy(&frame,bytes.data(),sizeof(frame));if(needs_swap)frame=byte_swap(frame);r.scalar("send_counter",frame);}}
+                startup_audit::writer().send(r);
+            }
             // Log for debugging (show first token value and frame info if available)
             std::string frame_info = "";
             if (frame_index_idx >= 0) {

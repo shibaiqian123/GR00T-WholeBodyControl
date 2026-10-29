@@ -134,9 +134,12 @@ def run(a,ui):
                     record('command',command=key,mode=control.mode);show('OK '+key+' -> '+control.mode)
                 except ValueError as exc:record('command_rejected',command=key,error=str(exc));show('REJECTED: '+str(exc))
             if sensor_ok and control.mode!='stop' and not busy and now-last_request>=.35:
-                buf=io.BytesIO();Image.fromarray(image).save(buf,format='PNG')
-                req=dict(op='infer',generation=control.generation,request_id=rid,observed_at=observed,state=state.tolist(),lang=a.task_prompt,image_png=base64.b64encode(buf.getvalue()).decode('ascii'))
-                np.savez_compressed(a.log_dir/f'input_{rid:06d}.npz',image=image,state=state,observed_at=observed,body_sample_time=bm['sample_time'],body_source_tick=bm['source_tick'],dex_feedback_time=[x['feedback_time'] for x in feedback])
+                raw=dict(image=image.copy(),state=state.copy(),observed_at=observed,
+                         body_sample_time=bm['sample_time'],body_source_tick=bm['source_tick'],
+                         dex_feedback_time=[x['feedback_time'] for x in feedback])
+                req=dict(op='infer',generation=control.generation,request_id=rid,observed_at=observed,
+                         state=state.tolist(),lang=a.task_prompt,_input=raw,
+                         _input_path=str(a.log_dir/f'input_{rid:06d}.npz'))
                 requests.put_nowait(req);busy=True;last_request=now;rid+=1
             action=control.action(now,sensor_ok,ready)
             target=None;target_mode=None

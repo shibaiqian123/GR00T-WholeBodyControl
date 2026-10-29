@@ -259,3 +259,9 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              CXX_EXTENSIONS OFF)
+# Offline decoder parity audit: no deployment main or DDS controller is linked.
+add_executable(replay_sonic_decoder replay_decoder.cpp)
+target_include_directories(replay_sonic_decoder PRIVATE ${EXE_INCLUDES} ${CMAKE_CURRENT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+target_link_directories(replay_sonic_decoder PRIVATE ${CUDA_LINK_DIRS})
+target_link_libraries(replay_sonic_decoder PRIVATE TRTInference CUDA::cudart ${TensorRT_nvinfer_LIBRARY} ${TensorRT_nvonnxparser_LIBRARY})
+set_target_properties(replay_sonic_decoder PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/")
