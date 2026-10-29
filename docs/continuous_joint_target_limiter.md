@@ -15,3 +15,11 @@ JSON必需字段：`units="rad"`、`joint_order="hardware_29"`、非空`constrai
 诊断：开启SONIC_STARTUP_AUDIT后，原decoder_command保持原始目标；joint_target_limited记录raw_target、limited_target、actual_q、control_tick、using_encoder；dds_write_attempt记录实际发送尝试。审计不是硬实时执行确认。
 
 验证：test_joint_target_limiter.cpp使用每关节不同速度值，覆盖方向、启动种子、迟到不追赶、短周期、重置、NaN、越界、跟踪误差和失败不修改历史。测试参数为合成值，不能用于实机。随后应在隔离仿真验证稳定性、停止优先级及原始/限速/DDS目标链路，再考虑部署。
+
+## 五终端入口
+
+`launch_dit4dit_field.py --inference-mode async --joint-target-limits /实际配置路径.json --dry-run`检查配置结构并打印bottom命令，不创建tmux、不发送动作。去掉dry-run才启动进程；这不是实机验证许可。现有会话不会被自动重启。
+
+启动器优先读取显式参数，其次读取调用终端SONIC_JOINT_TARGET_LIMITS；两者都没有时在bottom命令中显式清除该变量，避免tmux遗留环境悄悄启用限速。启用时将校验后的配置复制到本轮日志目录并记录SHA256，同时开启bottom_target_audit.jsonl。实际启用要检查bottom日志中的[JointTargetLimiter] enabled，不应仅根据dry-run判断正在运行的进程。
+
+此入口是实机入口，拒绝simulation_only配置。结构校验不能证明限值合理。仿真仍使用隔离DDS38/lo入口。

@@ -1,6 +1,8 @@
 """Five-pane model-only launcher. No VR. Manual arm then model; O remains bottom stop."""
 import argparse
 import json
+import hashlib
+import math
 import os
 from pathlib import Path
 import shlex
@@ -15,6 +17,7 @@ p.add_argument('--interface',default='enx6c1ff7b8d821')
 p.add_argument('--task-prompt',default='Pick up the cup on the left with your left gripper. Then pick up the red block on the right with your right gripper and place it into the cup held in your left gripper. Finally, place the cup, with the red block inside, back on the table using your left gripper.')
 p.add_argument('--inference-mode',choices=('async','sync'),default='async')
 p.add_argument('--segment-frames',type=int,default=10)
+p.add_argument('--joint-target-limits',type=Path,default=os.environ.get('SONIC_JOINT_TARGET_LIMITS'),help='Explicit continuous 29-joint limiter JSON; defaults to caller SONIC_JOINT_TARGET_LIMITS, otherwise disabled')
 p.add_argument('--dry-run',action='store_true')
 p.add_argument('--no-attach',action='store_true')
 a=p.parse_args()
@@ -25,8 +28,41 @@ root=Path(__file__).resolve().parents[2];session=a.session
 out=root/'outputs'/('model_only_'+time.strftime('%Y%m%d_%H%M%S'))
 limits='gear_sonic/configs/dex1_limits.g1_20261013.json'
 tele=str(root/'.venv_teleop/bin/python');data=str(root/'.venv_data_collection/bin/python');task=a.task_prompt
+# Resolve in the calling process: tmux server environment may be stale.
+limiter_config=None
+limiter_source=None
+if a.joint_target_limits is not None:
+    try:
+        limiter_source=a.joint_target_limits.expanduser().resolve(strict=True)
+        limiter_config=json.loads(limiter_source.read_text())
+        if limiter_config.get('units')!='rad' or limiter_config.get('joint_order')!='hardware_29':
+            raise ValueError('units=rad and joint_order=hardware_29 required')
+        if not isinstance(limiter_config.get('constraint_source'),str) or not limiter_config['constraint_source'].strip():
+            raise ValueError('constraint_source required')
+        if limiter_config.get('simulation_only',False) is not False:
+            raise ValueError('simulation-only limits cannot be used by this real-robot launcher')
+        for key in ('q_min','q_max','max_velocity','max_tracking_error'):
+            values=limiter_config.get(key)
+            if not isinstance(values,list) or len(values)!=29 or any(type(v) not in (int,float) or not math.isfinite(v) for v in values):
+                raise ValueError(key+' must contain 29 finite numbers')
+        for i in range(29):
+            if limiter_config['q_min'][i]>=limiter_config['q_max'][i] or limiter_config['max_velocity'][i]<=0 or limiter_config['max_tracking_error'][i]<=0:
+                raise ValueError('invalid bounds at hardware joint '+str(i))
+        if os.environ.get('SONIC_SINGLE_STEP_CONFIG') or os.environ.get('VIBE_HYBRID_ENDPOINT'):
+            raise ValueError('continuous limiter incompatible with single-step/hybrid')
+    except (OSError,ValueError,TypeError,AttributeError) as e:
+        p.error('joint target limiter: '+str(e))
+# Use a validated per-run copy; preserve the exact configuration with the logs.
+limiter_run_path=out/'joint_target_limits.json'
+bottom_env=['env','-u','SONIC_JOINT_TARGET_LIMITS']
+if limiter_config is not None:
+    bottom_env += ['SONIC_JOINT_TARGET_LIMITS='+str(limiter_run_path),
+                   'SONIC_STARTUP_AUDIT='+str(out/'bottom_target_audit.jsonl')]
+    print('JOINT TARGET LIMITER: enabled; config='+str(limiter_source)+'; validation checks format only, not hardware safety')
+else:
+    print('JOINT TARGET LIMITER: disabled (explicitly clears inherited tmux setting)')
 commands=[
- ('bottom','cd '+shlex.quote(str(root/'gear_sonic_deploy'))+' && '+shlex.join(['./deploy.sh','--cp','policy/sonic_v1_1/model','--obs-config','policy/sonic_v1_1/observation_config.yaml','--input-type','zmq_manager','--motor-kp-scale','4,10=1.5','--motor-kd-scale','4,10=1.5','--enable-dex1-heartbeat',a.interface])),
+ ('bottom','cd '+shlex.quote(str(root/'gear_sonic_deploy'))+' && '+shlex.join(bottom_env+['./deploy.sh','--cp','policy/sonic_v1_1/model','--obs-config','policy/sonic_v1_1/observation_config.yaml','--input-type','zmq_manager','--motor-kp-scale','4,10=1.5','--motor-kd-scale','4,10=1.5','--enable-dex1-heartbeat',a.interface])),
  ('observations',shlex.join([tele,'-u','-m','gear_sonic.scripts.run_model_observers','--interface',a.interface])),
  ('dex1',shlex.join([tele,'-u','-m','gear_sonic.scripts.run_dex1_trigger_control','--interface',a.interface,'--limits',limits,'--model-only','--target-port','5563','--telemetry-port','5559','--travel-time','2','--obstruction-hold','--obstruction-timeout','0.5','--execute'])),
  ('gateway',shlex.join([data,'-u','-m','gear_sonic.scripts.run_dit4dit_model','--task-prompt',task,'--limits',limits,'--log-dir',str(out/'gateway'),'--inference-mode',a.inference_mode,'--segment-frames',str(a.segment_frames),'--execute'])),
@@ -48,6 +84,9 @@ for port in (5556,5557,5559,5560,5562,5563,5564):
 for required in (Path(tele),Path(data),root/limits):
     if not required.exists():raise SystemExit('Missing: '+str(required))
 out.mkdir(parents=True,exist_ok=False)
+if limiter_config is not None:
+    limiter_run_path.write_text(json.dumps(limiter_config,indent=2,allow_nan=False)+'\n')
+    (out/'joint_target_limits_source.json').write_text(json.dumps(dict(source=str(limiter_source),saved_sha256=hashlib.sha256(limiter_run_path.read_bytes()).hexdigest()),indent=2))
 def tm(*args):
     return subprocess.check_output(['tmux',*args],text=True).strip()
 # Build the complete layout before starting any control process.
