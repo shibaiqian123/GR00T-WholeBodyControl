@@ -1,6 +1,7 @@
 #include "startup_audit.hpp"
 #include "readonly_decode_snapshot.hpp"
 #include "single_step_endpoint.hpp"
+#include "joint_target_limiter.hpp"
 #include "vibe_hybrid.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
@@ -305,6 +306,7 @@ class G1Deploy {
     bool enable_dex1_heartbeat_ = false;
     MotorGainScaleConfig motor_gain_scales_;
     std::unique_ptr<SingleStepEndpoint> single_step_;
+    std::unique_ptr<JointTargetLimiter> joint_target_limiter_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
@@ -2240,6 +2242,14 @@ class G1Deploy {
         std::ifstream f(config);nlohmann::json c;f>>c;
         SingleStepEndpoint::validate_environment(c,dds_domain,networkInterface);
       }
+      if(const char* config=std::getenv("SONIC_JOINT_TARGET_LIMITS")) {
+        if(std::getenv("SONIC_SINGLE_STEP_CONFIG") || !vibe_hybrid_endpoint.empty())
+          throw std::runtime_error("continuous target limiter incompatible with single-step/hybrid");
+        std::ifstream f(config);nlohmann::json c;f>>c;
+        SingleStepEndpoint::validate_environment(c,dds_domain,networkInterface);
+        joint_target_limiter_=std::make_unique<JointTargetLimiter>(c);
+        std::cout << "[JointTargetLimiter] enabled for all normal CONTROL targets; source=" << c.at("constraint_source") << std::endl;
+      }
       ChannelFactory::Instance()->Init(dds_domain, networkInterface);
       std::cout << "[DDS] domain=" << dds_domain << " interface=" << networkInterface << std::endl;
 
@@ -2845,6 +2855,7 @@ class G1Deploy {
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
+      if(joint_target_limiter_)joint_target_limiter_->reset();
       auto low_state_data = vibe_hybrid_endpoint.empty() ? low_state_buffer_.GetDataWithTime() : hybrid_snapshot_;
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       if (!ls) {
@@ -3323,7 +3334,27 @@ class G1Deploy {
         if(ls){std::array<double,29> q{},dq{};for(int i=0;i<29;++i){q[i]=ls->motor_state()[i].q();dq[i]=ls->motor_state()[i].dq();}r.array("actual_q",q).array("actual_dq",dq).array("imu_quaternion",ls->imu_state().quaternion()).array("imu_gyro",ls->imu_state().gyroscope());}
         startup_audit::writer().send(r);
       }
+      if(joint_target_limiter_) {
+        if(operator_state.stop)return false; // Never smooth STOP/damping or INIT.
+        try {
+          if(!used_low_state_data_.data || used_low_state_data_.GetAgeMs()<0 || used_low_state_data_.GetAgeMs()>LOW_STATE_LATE_THRESHOLD.count())
+            throw std::runtime_error("limiter needs fresh low state");
+          JointTargetLimiter::Vec raw{},actual{},seed{};
+          const auto prior=motor_command_buffer_.GetDataWithTime().data;
+          if(!prior)throw std::runtime_error("limiter missing previous command");
+          for(int i=0;i<29;++i){raw[i]=motor_command_tmp.q_target[i];actual[i]=used_low_state_data_.data->motor_state()[i].q();seed[i]=prior->q_target[i];}
+          const auto limited=joint_target_limiter_->apply(raw,actual,seed,SingleStepEndpoint::now(),control_dt_);
+          for(int i=0;i<29;++i)motor_command_tmp.q_target[i]=static_cast<float>(limited[i]);
+          startup_audit::Row row("joint_target_limited");
+          row.scalar("control_tick",logging_counter_).scalar("using_encoder",is_using_encoder_).array("raw_target",raw).array("limited_target",motor_command_tmp.q_target).array("actual_q",actual);
+          startup_audit::writer().send(row);
+        } catch(const std::exception& e) {
+          std::cerr << "[JointTargetLimiter] STOP: " << e.what() << std::endl;
+          operator_state.stop=true;return false;
+        }
+      }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
+      if(joint_target_limiter_ && operator_state.stop)return false;
       if(single_step_ && operator_state.stop){single_step_->cancel();return false;}
       motor_command_buffer_.SetData(motor_command_tmp);
       if(single_step_&&(single_decode||single_return)) {
