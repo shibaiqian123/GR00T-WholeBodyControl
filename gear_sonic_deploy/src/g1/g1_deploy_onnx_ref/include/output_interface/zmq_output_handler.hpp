@@ -208,18 +208,19 @@ public:
      * Called once during init (from g1_deploy_onnx_ref.cpp) and then on every
      * control-loop tick from `publish()`.
      */
-    void publish_control_status(const std::string& state, bool stop, bool token_ready = false) override {
+    void publish_control_status(const std::string& state, bool stop, bool token_ready = false, int external_stream = -1) override {
         // The control thread owns this socket. Stop() sends only after joining it.
         const double now = std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         msgpack::sbuffer buffer;
         msgpack::packer<msgpack::sbuffer> pk(buffer);
-        pk.pack_map(5);
+        pk.pack_map(6);
         pk.pack(std::string("seq")); pk.pack(++control_status_sequence_);
         pk.pack(std::string("time")); pk.pack(now);
         pk.pack(std::string("state")); pk.pack(state);
         pk.pack(std::string("stop")); pk.pack(stop);
         pk.pack(std::string("token_ready")); pk.pack(token_ready);
+        pk.pack(std::string("external_stream")); pk.pack(external_stream);
         try { send_zmq_message("dex1_control_status ", buffer); }
         catch (const zmq::error_t&) { /* External watchdog will latch on missing heartbeat. */ }
     }

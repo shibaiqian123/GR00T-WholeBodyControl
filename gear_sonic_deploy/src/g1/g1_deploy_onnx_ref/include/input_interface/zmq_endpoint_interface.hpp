@@ -108,7 +108,8 @@ public:
 
     /// When true, handle_input() reads from the ZMQ stream instead of
     /// pre-loaded reference motions.
-    bool use_zmq_stream = false;
+    std::atomic<bool> use_zmq_stream{false};
+    int ExternalStreamState() const override { return use_zmq_stream.load() ? 1 : 0; }
     
     /// Reusable sliding-window merger that handles frame alignment, gap
     /// detection, and catch-up logic for streamed motion data.

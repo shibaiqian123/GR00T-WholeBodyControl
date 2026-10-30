@@ -108,7 +108,7 @@ public:
     virtual void publish_config() {}
 
     // Optional external gripper watchdog; called only by an explicitly enabled controller.
-    virtual void publish_control_status(const std::string&, bool, bool = false) {}
+    virtual void publish_control_status(const std::string&, bool, bool = false, int = -1) {}
 
 protected:
 

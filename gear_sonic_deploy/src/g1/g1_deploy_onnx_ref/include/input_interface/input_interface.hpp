@@ -138,6 +138,9 @@ public:
     }
     
     /// @return True if an external token-state vector is available (e.g. from ROS2/ZMQ).
+    // -1 unknown; 0 default reference; 1 external stream. Not an execution ack.
+    virtual int ExternalStreamState() const { return -1; }
+
     virtual bool HasExternalTokenState() const {
       return has_external_token_state_;
     }
