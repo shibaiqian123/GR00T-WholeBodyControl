@@ -195,7 +195,7 @@ class Runtime:
     def grippers(self):
         d, s = self.d, self.s
         c = d['RampController'](self.limits, timeout=.25, obstruction_hold=True, obstruction_timeout=.5)
-        model = d['ModelGripInput']()
+        model = d['ModelGripInput'](allow_default_reference_control=True)
         deadline = time.monotonic()
         try:
             while not self.stop.is_set():
@@ -268,12 +268,43 @@ def conflict_check(a):
                 raise RuntimeError(f'Conflicting local publisher port {port}; no process was stopped')
 
 
+class WarmupRetry(Exception):
+    """Only an expired, unpublished first prediction may reset the RTC session."""
+
+
 async def session(a, d, s, info, limits, recorder):
+    for attempt in range(2):
+        try:
+            return await session_once(a, d, s, info, limits, recorder, attempt)
+        except WarmupRetry:
+            print('WARMUP_DISCARDED: new connection, new observation, no action history', flush=True)
+            # Wait for a camera sample captured after warmup, not merely a new UUID.
+            completed = time.monotonic()
+            while True:
+                with s.lock:
+                    now = time.monotonic()
+                    if s.fault: raise RuntimeError(s.fault)
+                    if a.execute:
+                        if not s.bottom(now, ('CONTROL',)) or (s.heartbeat or {}).get('external_stream') != 0:
+                            s.fail('SONIC changed state during warmup; stop manually')
+                            raise RuntimeError(s.fault)
+                        s.target = control_packet(s, 'hold', now)
+                    try: obs = s.observation_now(now)
+                    except ValueError: obs = None
+                    if obs is not None and obs['observed_at'] > completed: break
+                    if now-completed > 10:
+                        s.fail('No new observation after warmup')
+                        raise TimeoutError(s.fault)
+                await asyncio.sleep(.001)
+
+
+async def session_once(a, d, s, info, limits, recorder, attempt):
     import websockets
     import zmq
     clock = ConsumptionClock(uuid.uuid4().hex, info['action_exec_horizon_default'])
     ctx = pub = None
     tasks = []
+    warmup_retry = False
     if a.execute:
         ctx = zmq.Context(); pub = ctx.socket(zmq.PUB)
         pub.setsockopt(zmq.LINGER, 0); pub.setsockopt(zmq.SNDHWM, 1)
@@ -295,8 +326,9 @@ async def session(a, d, s, info, limits, recorder):
             requested = None; request_time = None; deadline = None
             response = tokens = grips = None
             running = not a.execute; arm_pending = False; frame = 0; blocks = 0
+            stream_seen = False; last_receive = None; last_stream = None
             wait_start = time.monotonic()
-            print('Commands: arm, run, stop, quit. SONIC start/stream remains manual.', flush=True)
+            print('Commands: stop, quit. Waiting for default-reference CONTROL; no arm/run needed.', flush=True)
             def request(now):
                 nonlocal requested, request_time
                 requested = s.observation_now(now)
@@ -316,32 +348,45 @@ async def session(a, d, s, info, limits, recorder):
                         now = time.monotonic()
                         if key == 'quit': return
                         if key == 'stop': raise RuntimeError('Manual stop')
-                        try:
-                            if key == 'arm':
-                                if s.armed: raise ValueError('Already armed; restart to re-enable')
-                                s.observation_now(now)
-                                if not s.bottom(now, ('WAIT_FOR_CONTROL',)):
-                                    raise ValueError('arm requires fresh WAIT_FOR_CONTROL heartbeat')
-                                s.armed = True; arm_pending = True
-                                s.target = control_packet(s, 'arm', now)
-                                emit('arm_requested')
-                            elif key == 'run':
-                                if running: raise ValueError('Already running')
-                                if not s.armed or s.grip_phase != 'READY': raise ValueError('arm first')
-                                if not s.bottom(now, ('CONTROL',)): raise ValueError('Start SONIC manually first; CONTROL required')
-                                s.observation_now(now); running = True
-                                emit('run_requested')
-                            elif key: print('Commands: arm, run, stop, quit', flush=True)
-                        except ValueError as exc: print('REJECTED:', exc, flush=True)
+                        if key: print('Commands: stop, quit. Enable stream manually in SONIC.', flush=True)
                 with s.lock:
                     now = time.monotonic()
                     if s.fault: raise RuntimeError(s.fault)
-                    if s.armed:
+                    stream = None
+                    if a.execute:
+                        hb = s.heartbeat or {}
+                        stream = hb.get('external_stream')
+                        if hb and (type(stream) is not int or stream not in (0, 1)):
+                            raise RuntimeError('Missing/unknown external_stream; rebuild SONIC before enabling')
+                        if s.bottom(now, ('CONTROL',)) and stream == 1 and frame == 0:
+                            raise RuntimeError('External stream enabled before first publication; stop SONIC manually')
+                        if not s.armed:
+                            if not s.bottom(now, ('CONTROL',)) or stream != 0:
+                                await asyncio.sleep(.001)
+                                continue
+                            try: s.observation_now(now)
+                            except ValueError:
+                                await asyncio.sleep(.001)
+                                continue
+                            s.armed = True; arm_pending = True
+                            emit('automatic_hold_initialization')
                         s.observation_now(now)
-                        if not s.bottom(now): raise RuntimeError('Bottom stopped/stale')
+                        if not s.bottom(now, ('CONTROL',)):
+                            raise RuntimeError('Bottom stopped/stale/not CONTROL')
+                        if stream != last_stream:
+                            emit('stream_state_observed', external_stream=stream,
+                                 heartbeat_time=hb['time'], heartbeat_age=now-hb['time'],
+                                 hardware_synchronization_confirmed=False)
+                            print('EXTERNAL_STREAM:', stream, flush=True)
+                            last_stream = stream
+                        if stream_seen and stream == 0:
+                            raise RuntimeError('External stream disabled; delivery stopped, restart client to resume')
+                        stream_seen = stream_seen or stream == 1
                         if arm_pending and s.grip_phase == 'READY':
-                            arm_pending = False; print('ARMED: holding current grippers', flush=True)
-                        if deadline is None:
+                            arm_pending = False
+                            print('GRIPPERS_READY: holding current opening', flush=True)
+                        if s.grip_phase == 'READY': running = True
+                        if deadline is None or stream == 0:
                             s.target = control_packet(s, 'arm' if arm_pending else 'hold', now)
                     if running and requested is None:
                         try: request(now)
@@ -353,10 +398,16 @@ async def session(a, d, s, info, limits, recorder):
                         tokens, grips = validate_reply(result, requested, info, limits)
                         age = now-requested['observed_at']
                         if not 0 <= age < (0.5 if deadline is None else 1.0):
+                            if age >= .5 and deadline is None and frame == 0 and attempt == 0 and (not a.execute or stream == 0):
+                                recorder.add('warmup_discarded.json', dict(result=result, observation_age=age))
+                                raise WarmupRetry()
                             raise ValueError('Prediction too old for execution/consumption')
                         if not clock.accept(result): raise ValueError('Old-session result')
                         response = result; blocks += 1
                         recorder.add(f'chunk_{blocks:04d}.json', result)
+                        interval = None if last_receive is None else now-last_receive
+                        print(f'Received action: chunk={clock.chunk_id} age={age:.3f}s external_stream={stream}; recv_action interval={interval}', flush=True)
+                        last_receive = now
                         emit('accepted', chunk_id=clock.chunk_id, skipped_prefix=clock.position, observation_age=age)
                         if deadline is None: deadline = now
                         receive = asyncio.create_task(receiver()); tasks = [send, receive]
@@ -374,20 +425,26 @@ async def session(a, d, s, info, limits, recorder):
                         if a.execute:
                             pub.send(d['pack_pose_message']({'token_state': tokens[index].reshape(1,64),
                                 'frame_index': np.array([frame], dtype=np.int64)}, topic='pose', version=4), flags=zmq.NOBLOCK)
-                            s.target = packet
+                            if stream == 1: s.target = packet
+                            if frame == 0:
+                                print('TOKEN_PUBLISHING: valid first block published. Press Enter in SONIC to enable stream.', flush=True)
                         emit('delivered' if a.execute else 'readonly_consumed', frame_index=frame,
                              chunk_id=clock.chunk_id, index=index, token=tokens[index].tolist(),
-                             gripper_raw=grips[index].tolist(), schedule_lateness=now-deadline,
+                             gripper_raw=grips[index].tolist(), gripper_applied=bool(a.execute and stream == 1),
+                             external_stream=stream, schedule_lateness=now-deadline,
                              motor_execution_confirmed=False)
                         frame += 1; deadline += 1/HZ
                         if clock.position >= clock.horizon and clock.pending is None: request(now)
                 await asyncio.sleep(.001)
+    except WarmupRetry:
+        warmup_retry = True
+        raise
     except BaseException as exc:
         s.fail(str(exc) or type(exc).__name__)
         raise
     finally:
         # Latch before closing the connection and before any awaited cleanup.
-        s.fail('Client session ended; no automatic resume')
+        if not warmup_retry: s.fail('Client session ended; no automatic resume')
         clock.failed = True; clock.pending = None
         for task in tasks: task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -408,7 +465,7 @@ def parse_args(argv=None):
     p.add_argument('--limits', type=Path, default=ROOT/'gear_sonic/configs/dex1_limits.g1_20261013.json')
     p.add_argument('--output', type=Path)
     p.add_argument('--check', action='store_true', help='Imports/calibration only; no sensors, sockets or DDS')
-    p.add_argument('--execute', action='store_true', help='Enable publishers; still requires manual arm and run')
+    p.add_argument('--execute', action='store_true', help='Enable publishers after default-reference CONTROL; SONIC stream switch remains manual')
     a = p.parse_args(argv)
     if a.check and a.execute: p.error('--check excludes --execute')
     if not a.check and (not a.instruction or not a.instruction.strip() or a.output is None):

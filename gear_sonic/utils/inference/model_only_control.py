@@ -59,7 +59,9 @@ class ModelControl:
 
 class ModelGripInput:
     """Opt-in manual hold-current arm; existing RampController handles ongoing protection."""
-    def __init__(self):self.seen=set();self.active=None;self.hold=None
+    def __init__(self, *, allow_default_reference_control=False):
+        self.seen=set();self.active=None;self.hold=None
+        self.allow_default_reference_control=allow_default_reference_control
     def update(self,controller,packet,measured,heartbeat,now):
         p=packet or {};key=p.get('arm_id');mode=p.get('mode')
         valid=(p.get('valid') is True and p.get('stop') is False and fresh(p.get('time'),now) and fresh(p.get('sample_time'),now)
@@ -67,7 +69,8 @@ class ModelGripInput:
         if valid and mode=='arm' and key not in self.seen:
             self.seen.add(key)
             good=(heartbeat and fresh(heartbeat.get('time'),now) and heartbeat.get('stop') is False
-                  and heartbeat.get('state')=='WAIT_FOR_CONTROL')
+                  and (heartbeat.get('state')=='WAIT_FOR_CONTROL' if not self.allow_default_reference_control else
+                       heartbeat.get('state')=='CONTROL' and type(heartbeat.get('external_stream')) is int and heartbeat['external_stream']==0))
             for side in ('left','right'):
                 m=measured.get(side)
                 good=good and m is not None and len(m)>=3 and all(math.isfinite(x) for x in m) and controller._fresh(m[1],now) and controller.limits[side].contains(m[0])
