@@ -1,8 +1,8 @@
-# DiT4DiT test-time RTC deployment (read-only validation stage)
+# DiT4DiT test-time RTC deployment
 
 Canonical source on229: `/home/cqu023/GR00T-WholeBodyControl/dit4dit/src/deploy`.
 32 runtime copy: `/share/2025slx/DIT4DIT/rtc_deploy`.
-This directory is independent of the old five-terminal launcher. No file here creates a DDS publisher, ZMQ robot command socket, or motor controller. `readonly_client.py` consumes actions into a JSONL log only. It does **not** implement SONIC execution or authorization to move a robot.
+This directory is independent of the old five-terminal launcher. The saved-observation client is read-only. The separate live client creates command publishers only with explicit --execute; see the live startup section below. `readonly_client.py` consumes actions into a JSONL log only. It does **not** implement SONIC execution or authorization to move a robot.
 
 ## Sampling contract
 
@@ -82,3 +82,36 @@ The existing `start_server.sh` now also accepts environment-only startup: explic
 Set the229 readonly client to `--url ws://127.0.0.1:8014/ws --action-exec-horizon 30` and tunnel8014 to8014. `/info` advertises the configured horizon and the server rejects premature replans. A window30 has20 frames remaining; previous validation used25, so it does not certify the30-frame real-network latency budget. Invalid delay/overlap still fails; no timeout is widened.
 
 `--host 0.0.0.0` is supported if deliberately exposing the server directly. This unauthenticated diagnostic endpoint defaults to loopback + SSH forwarding.
+
+## 实时客户端：Psi0 顺序（229）
+
+本节使用 `run_dit4dit_rtc_sonic_dex1.py`；上面的 `readonly_client.py` 仍是保存文件回放入口。
+不同时运行旧 gateway、独立 Dex1 命令服务或另一个 RTC 客户端。
+
+1. 启动相机/本体观测和32推理服务，再建立8014 SSH隧道。229执行 `curl --fail http://127.0.0.1:8014/info` 核对 state31、action50x66、test_time及资源哈希。
+2. 启动 SONIC V1.1：`bash dit4dit/script/deploy_dit4dit_sonic_robot.sh --interface enx6c1ff7b8d821`。初始化后按 `]`，等待默认参考控制稳定；先不要按 Enter。CONTROL并不意味着默认参考的跟踪稳定，仍需现场确认。更新后须使用新编译的底层，旧心跳缺少流状态将被拒绝。
+3. 在229启动客户端（每个进程保持独立终端）：
+
+```bash
+cd /home/cqu023/GR00T-WholeBodyControl
+SONIC_CONDA_PREFIX="$PWD/.venv_teleop" \
+bash dit4dit/script/deploy_dit4dit-sonic-rtc-client.sh \
+  --host 127.0.0.1 --port 8014 \
+  --camera-port 5555 --body-port 5564 \
+  --network enx6c1ff7b8d821 \
+  --instruction 'Pick up the cup on the left with your left gripper. Then pick up the red block on the right with your right gripper and place it into the cup held in your left gripper. Finally, place the cup, with the red block inside, back on the table using your left gripper.' \
+  --output "$PWD/outputs/rtc_execute_$(date +%Y%m%d_%H%M%S)" \
+  --execute
+```
+
+默认不传 `--execute` 是只读实时推理，不创建动作发布者。`--check` 只检查依赖/标定，不打开相机、DDS或网络连接。启动脚本是本机已有包装器；亦可直接用 `.venv_teleop/bin/python dit4dit/src/deploy/run_dit4dit_rtc_sonic_dex1.py` 配相同参数。
+
+4. 客户端自动检查 CONTROL + external_stream=0 并初始化夹爪保持，无需 `arm/run`。等待 `GRIPPERS_READY`、`Received action` 和 `TOKEN_PUBLISHING`，且没有故障，再在C++终端按 Enter。确认C++打印 `ZMQ STREAMING MODE: ENABLED`、客户端报告 `EXTERNAL_STREAM: 1`。等待期间动作帧持续消费/重规划，不固定第一帧；开启流后夹爪采用当前消费帧，不补发旧夹爪动作。
+
+`external_stream` 心跳：-1未知、0默认参考、1外部流。仅普通zmq输入报告确定值；模式状态不是首个token采用/执行确认。事件记录心跳时间、观察时间与心跳年龄，不将心跳年龄当成完整切换延迟，也不宣称身体和夹爪硬件同步。
+
+首次预测若超过原0.5秒新鲜度门限，且尚未发布动作/外部流关闭，允许仅一次作为预热结果丢弃；等待预热结束后拍摄的新观测，关闭旧连接并建立新会话普通采样，丢弃所有历史。第二次仍过期、网络失败或正式执行后过期均锁定；不扩大0.5/1秒门限或10秒请求超时。`warmup_discarded.json` 保留丢弃结果及年龄。
+
+正常结束：在C++终端按 Enter返回默认参考；客户端看到流关闭后停止新token和推理请求，进入既有受保护夹爪保持并锁定。确认现场状态后Ctrl+C客户端，再按O退出底层。紧急情况使用既有O/硬件急停流程。默认参考切换、FAULT_HOLD及停止后的支撑并未验证为安全状态。
+
+客户端 `stop` 停止发布并锁定，`quit`/Ctrl+C关闭资源；关闭后夹爪软件保持结束。自动断网停控尚未闭环，客户端停止发布不等于SONIC停止控制。首目标连续性、实际采用帧确认仍未解决；本轮只有静态/内存与编译验证，没有实机验收。
