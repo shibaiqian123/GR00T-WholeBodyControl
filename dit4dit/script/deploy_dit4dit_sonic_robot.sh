@@ -54,6 +54,7 @@ command=(bash ./deploy.sh
     --cp "$checkpoint"
     --obs-config "$obs_config"
     --input-type zmq
+    --enable-dex1-heartbeat
     --zmq-host 127.0.0.1
     "$interface")
 printf 'SONIC V1.1 | interface=%s | input=127.0.0.1:5556 topic=pose\n' "$interface"
