@@ -132,29 +132,48 @@ class Runtime:
 
     def start(self):
         self.dds = self.d['DdsGrippers'](self.a.network, execute=self.a.execute)
-        for fn in (self.sensors, self.grippers):
+        for fn in (self.heartbeats, self.sensors, self.grippers):
             t = threading.Thread(target=fn, daemon=True)
             self.threads.append(t)
             t.start()
 
+    def heartbeats(self):
+        # Keep status polling independent of image decode/resize/PNG encoding.
+        ctx = sock = None
+        try:
+            z = self.d['zmq']; ctx = z.Context(); sock = ctx.socket(z.SUB)
+            sock.setsockopt(z.LINGER, 0)
+            sock.setsockopt(z.SUBSCRIBE, b'dex1_control_status ')
+            sock.connect(f'tcp://127.0.0.1:{self.a.zmq_sub_port}')
+            reader = self.d['PacketReader'](sock, b'dex1_control_status ')
+            previous = None
+            while not self.stop.is_set():
+                hb = reader.poll()
+                with self.s.lock:
+                    self.s.heartbeat = hb
+                    signature = None if hb is None else (hb.get('state'), hb.get('stop'), hb.get('external_stream'), hb.get('reader_error'))
+                    if signature != previous:
+                        self.recorder.add(None, dict(kind='bottom_status', time=time.monotonic(), heartbeat=hb))
+                        previous = signature
+                    if hb and hb.get('reader_error'):
+                        self.s.fail('SONIC heartbeat rejected: ' + hb['reader_error'])
+                    elif self.s.armed and not self.s.bottom(time.monotonic()):
+                        self.s.fail('SONIC stopped or heartbeat stale')
+                self.stop.wait(.005)
+        except Exception as exc:
+            self.s.fail('Heartbeat worker: ' + str(exc))
+        finally:
+            if sock is not None: sock.close()
+            if ctx is not None: ctx.term()
+
     def sensors(self):
-        camera = body = ctx = hb_socket = None
+        camera = body = None
         try:
             d, a = self.d, self.a
             robot = d['instantiate_g1_robot_model'](waist_location='lower_and_upper_body')
             camera = d['ComposedCameraClientSensor']('127.0.0.1', a.camera_port)
             body = d['ReadOnlyBodySubscriber'](a.body_port)
-            zmq = d['zmq']; ctx = zmq.Context(); hb_socket = ctx.socket(zmq.SUB)
-            hb_socket.setsockopt(zmq.LINGER, 0)
-            hb_socket.setsockopt(zmq.SUBSCRIBE, b'dex1_control_status ')
-            hb_socket.connect(f'tcp://127.0.0.1:{a.zmq_sub_port}')
-            reader = d['PacketReader'](hb_socket, b'dex1_control_status ')
             while not self.stop.is_set():
-                hb = reader.poll()
-                with self.s.lock:
-                    self.s.heartbeat = hb
-                    if self.s.armed and not self.s.bottom(time.monotonic()):
-                        self.s.fail('SONIC stopped or heartbeat stale')
                 cm, bm = camera.read(), body.get_msg()
                 measured = self.dds.snapshot(); now = time.monotonic()
                 dex = dict(time=now, sides={s: dict(q=m[0], feedback_time=m[1],
@@ -189,8 +208,6 @@ class Runtime:
         finally:
             if camera is not None: camera.close()
             if body is not None: body.close()
-            if hb_socket is not None: hb_socket.close()
-            if ctx is not None: ctx.term()
 
     def grippers(self):
         d, s = self.d, self.s
@@ -355,6 +372,10 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                     stream = None
                     if a.execute:
                         hb = s.heartbeat or {}
+                        if hb.get('reader_error'):
+                            raise RuntimeError('SONIC heartbeat rejected: ' + hb['reader_error'])
+                        if hb.get('stop') is True:
+                            raise RuntimeError('SONIC reports STOP; no model enable')
                         stream = hb.get('external_stream')
                         if hb and (type(stream) is not int or stream not in (0, 1)):
                             raise RuntimeError('Missing/unknown external_stream; rebuild SONIC before enabling')

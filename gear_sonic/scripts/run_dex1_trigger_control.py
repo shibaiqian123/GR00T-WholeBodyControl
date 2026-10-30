@@ -87,7 +87,7 @@ class PacketReader:
             except (ValueError,TypeError,KeyError,OverflowError,msgpack.ExtraData,msgpack.FormatError,msgpack.StackError) as exc:
                 self.last_error=str(exc)
                 invalid_time=time.monotonic() if now is None else now
-                fault={'time':invalid_time,'sample_time':invalid_time,'valid':False,'stop':True,'state':'STOP'}
+                fault={'time':invalid_time,'sample_time':invalid_time,'valid':False,'stop':True,'state':'STOP','reader_error':str(exc)}
         return fault if fault is not None else self.latest
 
 class TargetReader:
