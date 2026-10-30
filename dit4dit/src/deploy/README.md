@@ -72,3 +72,13 @@ cd /share/2025slx/DIT4DIT/rtc_deploy
 `extract_validation_sample.py` can extract episode0/frame0 from the existing converted dataset using its recorded observation.sonic_state and first video frame. It records hashes, task, episode/frame and dataset-relative timestamp. It never substitutes zeros for missing data. Yesterday's missing manual capture is not reconstructed by this fixture.
 
 See VALIDATION.md for measured results. Old workflows, checkpoints, data and SONIC protection settings are unchanged. Retirement of old entrypoints requires a later integration acceptance step.
+
+## Psi0-style launch (added)
+
+The existing `start_server.sh` now also accepts environment-only startup: explicitly set CHECKPOINT_DIR, CHECKPOINT_STEP and POLICY_GPU_UUID, then run `bash start_server.sh`. Its environment-only defaults are port8014, client execution horizon30, loopback host, and policydit4dit. The prior explicit-argument invocation remains compatible (serve.py defaults remain8000/25).
+
+`serve.py --host 127.0.0.1 --port 8014 --action_exec_horizon 30 --policy dit4dit --rtc --run-dir "$CHECKPOINT_DIR" --ckpt-step "$CHECKPOINT_STEP" --cosmos "$COSMOS_PATH"` is supported. Step19000 resolves strictly to `checkpoints/steps_19000_pytorch_model.pt`; there is no latest/fallback checkpoint. `--rtc` explicitly selects the already-default test-time path, not train-time RTC.
+
+Set the229 readonly client to `--url ws://127.0.0.1:8014/ws --action-exec-horizon 30` and tunnel8014 to8014. `/info` advertises the configured horizon and the server rejects premature replans. A window30 has20 frames remaining; previous validation used25, so it does not certify the30-frame real-network latency budget. Invalid delay/overlap still fails; no timeout is widened.
+
+`--host 0.0.0.0` is supported if deliberately exposing the server directly. This unauthenticated diagnostic endpoint defaults to loopback + SSH forwarding.

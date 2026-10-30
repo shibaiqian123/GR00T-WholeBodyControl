@@ -8,7 +8,9 @@ import uvicorn
 from protocol import shifted
 
 
-def create_app(policy):
+def create_app(policy, action_exec_horizon=25):
+    if not 1 <= action_exec_horizon < 50:
+        raise ValueError("action_exec_horizon must be 1..49")
     app = FastAPI()
     gpu_lock = asyncio.Lock()
     owner = None
@@ -19,7 +21,7 @@ def create_app(policy):
 
     @app.get('/info')
     async def info():
-        return dict(policy.info, action_exec_horizon_default=25, control_hz=50,
+        return dict(policy.info, action_exec_horizon_default=action_exec_horizon, control_hz=50,
                     timing='229_client_consumption_not_motor_ack', rtc_supported=True)
 
     @app.websocket('/ws')
@@ -81,6 +83,8 @@ def create_app(policy):
                             raise ValueError('First request consumed must be zero')
                         prefix = None
                     else:
+                        if s < action_exec_horizon:
+                            raise ValueError('Replan before configured action_exec_horizon')
                         if s < last_consumed:
                             raise ValueError('Consumption regressed')
                         prefix = shifted(previous, s, d)
@@ -130,20 +134,36 @@ def create_app(policy):
     return app
 
 
-def main():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--run', required=True)
-    p.add_argument('--checkpoint', required=True)
+    p.add_argument('--run', '--run-dir', dest='run', required=True)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument('--checkpoint')
+    g.add_argument('--ckpt-step', type=int)
     p.add_argument('--cosmos', required=True)
     p.add_argument('--port', type=int, default=8000)
-    a = p.parse_args()
+    p.add_argument('--host', default='127.0.0.1')
+    p.add_argument('--action_exec_horizon', '--action-exec-horizon', type=int, default=25)
+    p.add_argument('--policy', choices=['dit4dit'], default='dit4dit')
+    p.add_argument('--rtc', action='store_true', help='Explicit test-time RTC selection (also the default)')
+    a = p.parse_args(argv)
+    if not 1 <= a.action_exec_horizon < 50:
+        p.error('action_exec_horizon must be 1..49')
+    if a.ckpt_step is not None:
+        if a.ckpt_step <= 0: p.error('ckpt-step must be positive')
+        a.checkpoint = f'steps_{a.ckpt_step}_pytorch_model.pt'
+    return a
+
+
+def main():
+    a = parse_args()
     import socket
     with socket.socket() as probe:
-        probe.bind(('127.0.0.1', a.port))
+        probe.bind((a.host, a.port))
     from model_adapter import Policy
     policy = Policy(a.run, a.checkpoint, a.cosmos)
     print('RTC_READY '+json.dumps(policy.info), flush=True)
-    uvicorn.run(create_app(policy), host='127.0.0.1', port=a.port, ws_max_size=16*1024*1024)
+    uvicorn.run(create_app(policy, a.action_exec_horizon), host=a.host, port=a.port, ws_max_size=16*1024*1024)
 
 if __name__ == '__main__':
     main()
