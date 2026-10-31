@@ -31,6 +31,22 @@ class ConsumptionClock:
         self.failed = False
         self.delays = deque([10], maxlen=6)
 
+    def ready_to_request(self):
+        """Wait for enough consumed history; never relax the overlap bounds."""
+        if self.failed:
+            raise ValueError('Failed session')
+        if self.pending is not None:
+            return False
+        if self.chunk_id is None:
+            return True
+        delay = max(self.delays)
+        earliest = max(self.horizon, delay)
+        latest = min(H-delay, H-1)
+        if earliest > latest or self.position > latest:
+            raise ValueError(f'No feasible RTC overlap: position={self.position}, '
+                             f'delay={delay}, horizon={self.horizon}, latest={latest}')
+        return self.position >= earliest
+
     def request(self, request_id):
         if self.failed or self.pending is not None:
             raise ValueError('Failed session or request already in flight')

@@ -129,8 +129,14 @@ class Runtime:
         self.stop = threading.Event()
         self.dds = None
         self.threads = []
+        self.sensor_stage = "not_started"
+        self.gripper_stage = "not_started"
 
     def start(self):
+        # URDF/model construction can hold the GIL for seconds. Complete it
+        # before DDS and watchdog threads exist, so startup cannot queue stale
+        # heartbeats or pause an already-running gripper watchdog.
+        self.robot = self.d['instantiate_g1_robot_model'](waist_location='lower_and_upper_body')
         self.dds = self.d['DdsGrippers'](self.a.network, execute=self.a.execute)
         for fn in (self.heartbeats, self.sensors, self.grippers):
             t = threading.Thread(target=fn, daemon=True)
@@ -147,9 +153,25 @@ class Runtime:
             sock.connect(f'tcp://127.0.0.1:{self.a.zmq_sub_port}')
             reader = self.d['PacketReader'](sock, b'dex1_control_status ')
             previous = None
+            last_poll = time.monotonic()
+            last_lock_wait = last_lock_hold = 0.0
             while not self.stop.is_set():
+                poll_start = time.monotonic()
+                poll_gap = poll_start - last_poll
+                last_poll = poll_start
                 hb = reader.poll()
+                poll_end = time.monotonic()
+                if poll_gap > .05 or poll_end-poll_start > .05 or (hb and hb.get('reader_error')):
+                    self.recorder.add(None, dict(kind='heartbeat_timing', time=poll_end,
+                        poll_gap_seconds=poll_gap, poll_seconds=poll_end-poll_start,
+                        previous_lock_wait_seconds=last_lock_wait,
+                        previous_lock_hold_seconds=last_lock_hold,
+                        sensor_stage=self.sensor_stage, gripper_stage=self.gripper_stage,
+                        reader_error=None if hb is None else hb.get('reader_error')))
+                lock_start = time.monotonic()
                 with self.s.lock:
+                    lock_acquired = time.monotonic()
+                    last_lock_wait = lock_acquired-lock_start
                     self.s.heartbeat = hb
                     signature = None if hb is None else (hb.get('state'), hb.get('stop'), hb.get('external_stream'), hb.get('reader_error'))
                     if signature != previous:
@@ -159,6 +181,7 @@ class Runtime:
                         self.s.fail('SONIC heartbeat rejected: ' + hb['reader_error'])
                     elif self.s.armed and not self.s.bottom(time.monotonic()):
                         self.s.fail('SONIC stopped or heartbeat stale')
+                last_lock_hold = time.monotonic()-lock_acquired
                 self.stop.wait(.005)
         except Exception as exc:
             self.s.fail('Heartbeat worker: ' + str(exc))
@@ -170,23 +193,31 @@ class Runtime:
         camera = body = None
         try:
             d, a = self.d, self.a
-            robot = d['instantiate_g1_robot_model'](waist_location='lower_and_upper_body')
+            robot = self.robot
+            self.sensor_stage = 'camera_init'
             camera = d['ComposedCameraClientSensor']('127.0.0.1', a.camera_port)
+            self.sensor_stage = 'body_init'
             body = d['ReadOnlyBodySubscriber'](a.body_port)
             while not self.stop.is_set():
-                cm, bm = camera.read(), body.get_msg()
+                self.sensor_stage = 'camera_read'
+                cm = camera.read()
+                self.sensor_stage = 'body_read'
+                bm = body.get_msg()
+                self.sensor_stage = 'observation_validation'
                 measured = self.dds.snapshot(); now = time.monotonic()
                 dex = dict(time=now, sides={s: dict(q=m[0], feedback_time=m[1],
-                           feedback_valid=np.isfinite(m).all()) for s, m in measured.items()})
+                           feedback_valid=bool(np.isfinite(m).all())) for s, m in measured.items()})
                 diag = d['inspect_observation'](cm, bm, dex, self.limits, now, time.time(), body.cache.error)
                 try:
                     if not diag['ok'] or bm is None or bm.get('valid') is not True:
                         raise ValueError('; '.join(diag['reasons']) or 'invalid body state')
                     q = np.asarray(bm['body_q'], dtype=float)
+                    self.sensor_stage = 'state_conversion'
                     whole = robot.get_configuration_from_actuated_joints(body_actuated_joint_values=q)
                     state = d['sonic_state'](whole, [measured[s][0] for s in SIDES])
                     image_time = now-diag['camera_age_seconds']
                     source_times = [image_time, bm['sample_time']] + [measured[s][1] for s in SIDES]
+                    self.sensor_stage = 'image_encode'
                     b = io.BytesIO()
                     d['Image'].fromarray(np.asarray(cm['images']['ego_view']).copy()).resize(
                         (224, 224), d['Image'].Resampling.BILINEAR).save(b, format='PNG')
@@ -202,6 +233,7 @@ class Runtime:
                         self.s.observation = None
                         self.s.sensor_error = str(exc)
                         if self.s.armed: self.s.fail(exc)
+                self.sensor_stage = 'idle'
                 self.stop.wait(.01)
         except Exception as exc:
             self.s.fail('Observation worker: ' + str(exc))
@@ -228,11 +260,14 @@ class Runtime:
                         if not s.bottom(now): s.fail('SONIC heartbeat invalid')
                         if s.fault:
                             packet = dict(time=now, sample_time=0., valid=False, stop=True)
+                    self.gripper_stage = 'model_update'
                     targets = model.update(c, packet, measured, s.heartbeat, now)
                     s.grip_phase = c.phase
                     if s.armed and c.phase == 'FAULT_HOLD': s.fail('Dex1: ' + c.reason)
                     # FAULT_HOLD is existing behavior, NOT a verified safe state.
+                    self.gripper_stage = 'dds_write'
                     self.dds.write(targets)
+                    self.gripper_stage = 'post_write'
                     if s.armed:
                         try:
                             self.recorder.add(None, dict(kind='dex1_cycle', time=now,
@@ -335,9 +370,17 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
             async def sender():
                 while True:
                     packet = await outgoing.get()
+                    emit("send_started", request_id=packet.get("request_id"))
                     await ws.send(await asyncio.to_thread(json.dumps, packet))
+                    emit("send_finished", request_id=packet.get("request_id"))
             async def receiver():
-                return await asyncio.to_thread(json.loads, await ws.recv())
+                wire = await ws.recv()
+                received_at = time.monotonic()
+                result = await asyncio.to_thread(json.loads, wire)
+                emit("reply_received", received_at=received_at,
+                     request_id=result.get("request_id"), ok=result.get("ok"),
+                     inference_seconds=result.get("inference_seconds"))
+                return result
             send = asyncio.create_task(sender()); receive = asyncio.create_task(receiver())
             tasks = [send, receive]
             requested = None; request_time = None; deadline = None
@@ -455,7 +498,7 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                              external_stream=stream, schedule_lateness=now-deadline,
                              motor_execution_confirmed=False)
                         frame += 1; deadline += 1/HZ
-                        if clock.position >= clock.horizon and clock.pending is None: request(now)
+                        if clock.ready_to_request(): request(now)
                 await asyncio.sleep(.001)
     except WarmupRetry:
         warmup_retry = True
