@@ -11,6 +11,7 @@ Usage: deploy_dit4dit_sonic_robot.sh [--interface NAME] [--dry-run]
   -h, --help        Show this help.
 
 Uses SONIC V1.1 encoder/decoder and matching observation config.
+Includes official tested V1.1 ankle-pitch tuning: motors 4,10 Kp/Kd x1.5.
 Input: existing ZMQ pose protocol, 64D token, tcp://127.0.0.1:5556.
 Port 5556 and topic pose are the existing C++ defaults.
 Body state/history -> decoder -> existing 29-joint DDS control path.
@@ -54,6 +55,8 @@ command=(bash ./deploy.sh
     --cp "$checkpoint"
     --obs-config "$obs_config"
     --input-type zmq
+    --motor-kp-scale 4,10=1.5
+    --motor-kd-scale 4,10=1.5
     --enable-dex1-heartbeat
     --zmq-host 127.0.0.1
     "$interface")

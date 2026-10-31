@@ -85,6 +85,8 @@ Set the229 readonly client to `--url ws://127.0.0.1:8014/ws --action-exec-horizo
 
 ## 实时客户端：Psi0 顺序（229）
 
+机器人启动脚本显式包含官方经过测试的 SONIC V1.1 部署参数 `--motor-kp-scale 4,10=1.5` 和 `--motor-kd-scale 4,10=1.5`，针对左右踝 pitch 电机。官方将其标为 opt-in，本入口默认显式启用；它不是 RTC 滤波参数。来源：[NVlabs 官方 README](https://github.com/NVlabs/GR00T-WholeBodyControl#readme)。官方示例使用 `zmq_manager`；本 RTC 入口按现有人工 Enter 切流流程保留普通 `zmq`，仅对齐 V1.1 模型资源和增益调参。可先运行 `bash dit4dit/script/deploy_dit4dit_sonic_robot.sh --dry-run --interface enx6c1ff7b8d821` 核对最终命令；该检查不启动控制器。
+
 本节使用 `run_dit4dit_rtc_sonic_dex1.py`；上面的 `readonly_client.py` 仍是保存文件回放入口。
 不同时运行旧 gateway、独立 Dex1 命令服务或另一个 RTC 客户端。
 
