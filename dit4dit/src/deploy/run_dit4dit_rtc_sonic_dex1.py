@@ -6,6 +6,7 @@ and denormalized token64 + Dex1 motor-radian2. No automatic SONIC start/stop.
 Automatic network-loss stopping at the SONIC receiver is NOT closed-loop.
 """
 import argparse
+from latency_trace import mark, stamp
 import asyncio
 import base64
 import fcntl
@@ -199,6 +200,7 @@ class Runtime:
             self.sensor_stage = 'body_init'
             body = d['ReadOnlyBodySubscriber'](a.body_port)
             while not self.stop.is_set():
+                obs_build_start = stamp()
                 self.sensor_stage = 'camera_read'
                 cm = camera.read()
                 self.sensor_stage = 'body_read'
@@ -225,6 +227,8 @@ class Runtime:
                                state=state.tolist(), lang=a.instruction, observation_id=uuid.uuid4().hex,
                                observed_at=image_time, saved_observation=False,
                                body_source_tick=bm['source_tick'], source_times=source_times)
+                    obs['_latency_build_start'] = obs_build_start
+                    obs['_latency_ready'] = stamp()
                     with self.s.lock:
                         self.s.observation, self.s.sources = obs, source_times
                         self.s.sensor_error = ''
@@ -371,12 +375,20 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                 while True:
                     packet = await outgoing.get()
                     emit("send_started", request_id=packet.get("request_id"))
-                    await ws.send(await asyncio.to_thread(json.dumps, packet))
+                    tid = packet.get('request_id')
+                    mark(tid, 'request_encode_start')
+                    wire = await asyncio.to_thread(json.dumps, packet)
+                    mark(tid, 'request_send_start')
+                    await ws.send(wire)
+                    mark(tid, 'request_send_done')
                     emit("send_finished", request_id=packet.get("request_id"))
             async def receiver():
                 wire = await ws.recv()
+                receive_stamp = stamp()
                 received_at = time.monotonic()
                 result = await asyncio.to_thread(json.loads, wire)
+                mark(result.get('request_id'), 'reply_received', at=receive_stamp)
+                mark(result.get('request_id'), 'reply_decoded')
                 emit("reply_received", received_at=received_at,
                      request_id=result.get("request_id"), ok=result.get("ok"),
                      inference_seconds=result.get("inference_seconds"))
@@ -393,6 +405,11 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                 nonlocal requested, request_time
                 requested = s.observation_now(now)
                 req = clock.request(uuid.uuid4().hex); request_time = now
+                tid = req['request_id']
+                for field, stage in [('_latency_build_start', 'obs_build_start'), ('_latency_ready', 'obs_ready')]:
+                    if field in requested:
+                        mark(tid, stage, at=requested[field], observation_id=requested['observation_id'])
+                mark(tid, 'request_queued', observation_id=requested['observation_id'])
                 emit('request', **req, observation_id=requested['observation_id'],
                      observed_at=requested['observed_at'], source_times=requested['source_times'])
                 recorder.add('request_' + req['request_id'] + '.json', dict(req, observation=requested))
@@ -468,6 +485,8 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                             raise ValueError('Prediction too old for execution/consumption')
                         if not clock.accept(result): raise ValueError('Old-session result')
                         response = result; blocks += 1
+                        response['_latency_accepted'] = stamp()
+                        mark(result['request_id'], 'reply_accepted', at=response['_latency_accepted'])
                         recorder.add(f'chunk_{blocks:04d}.json', result)
                         interval = None if last_receive is None else now-last_receive
                         print(f'Received action: chunk={clock.chunk_id} age={age:.3f}s external_stream={stream}; recv_action interval={interval}', flush=True)
@@ -487,6 +506,9 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                         packet = control_packet(s, 'model', now, grips[index])
                         packet = d['target_to_trigger'](packet, limits, now)
                         if a.execute:
+                            action_trace = f'{clock.session}:frame:{frame}'
+                            mark(action_trace, 'action_ready', at=response['_latency_accepted'], request_id=response['request_id'])
+                            mark(action_trace, 'action_send', wire_frame_index=frame, request_id=response['request_id'])
                             pub.send(d['pack_pose_message']({'token_state': tokens[index].reshape(1,64),
                                 'frame_index': np.array([frame], dtype=np.int64)}, topic='pose', version=4), flags=zmq.NOBLOCK)
                             if stream == 1: s.target = packet

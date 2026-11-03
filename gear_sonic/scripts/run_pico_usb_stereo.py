@@ -1,5 +1,7 @@
 """Robot USB side-by-side camera to PICO; does not use motion interfaces."""
 import argparse
+import uuid
+from latency_trace import mark, stamp
 import datetime
 import os
 from pathlib import Path
@@ -42,14 +44,18 @@ class USBSource:
                     sock.settimeout(.7)
                     sock.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
                     while not self.stop_event.is_set():
+                        camera_trace = uuid.uuid4().hex
+                        mark(camera_trace, 'camera_request_229')
                         start=time.monotonic()
                         sock.sendall(b'N')
                         size=struct.unpack('>I',read_exact(sock,4))[0]
                         if not 4 <= size <= 8*1024*1024: raise ValueError('Invalid JPEG size')
                         data=read_exact(sock,size)
+                        mark(camera_trace, 'camera_payload_229', bytes=size)
                         frame=cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
                         if frame is None or frame.shape[:2] != (720,2560):
                             raise ValueError('Expected 2560x720 side-by-side source')
+                        mark(camera_trace, 'camera_jpeg_decoded_229')
                         self.last_rpc_ms=(time.monotonic()-start)*1000
                         self.latest.put(frame); self.frames+=1; self.last_error=''
                         self.stop_event.wait(max(0,1/self.fps-(time.monotonic()-start)))
