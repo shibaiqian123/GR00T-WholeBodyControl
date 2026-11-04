@@ -199,6 +199,9 @@ class Runtime:
             camera = d['ComposedCameraClientSensor']('127.0.0.1', a.camera_port)
             self.sensor_stage = 'body_init'
             body = d['ReadOnlyBodySubscriber'](a.body_port)
+            encoded_image = None
+            previous_image = None
+            previous_image_time = None
             while not self.stop.is_set():
                 obs_build_start = stamp()
                 self.sensor_stage = 'camera_read'
@@ -220,10 +223,16 @@ class Runtime:
                     image_time = now-diag['camera_age_seconds']
                     source_times = [image_time, bm['sample_time']] + [measured[s][1] for s in SIDES]
                     self.sensor_stage = 'image_encode'
-                    b = io.BytesIO()
-                    d['Image'].fromarray(np.asarray(cm['images']['ego_view']).copy()).resize(
-                        (224, 224), d['Image'].Resampling.BILINEAR).save(b, format='PNG')
-                    obs = dict(image_png=base64.b64encode(b.getvalue()).decode(),
+                    image = cm['images']['ego_view']
+                    image_source_time = cm['timestamps']['ego_view']
+                    # Only reuse the exact cached frame, never refresh its timestamp.
+                    if image is not previous_image or image_source_time != previous_image_time:
+                        b = io.BytesIO()
+                        d['Image'].fromarray(np.asarray(image).copy()).resize(
+                            (224, 224), d['Image'].Resampling.BILINEAR).save(b, format='PNG')
+                        encoded_image = base64.b64encode(b.getvalue()).decode()
+                        previous_image, previous_image_time = image, image_source_time
+                    obs = dict(image_png=encoded_image,
                                state=state.tolist(), lang=a.instruction, observation_id=uuid.uuid4().hex,
                                observed_at=image_time, saved_observation=False,
                                body_source_tick=bm['source_tick'], source_times=source_times)
@@ -415,6 +424,8 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                 recorder.add('request_' + req['request_id'] + '.json', dict(req, observation=requested))
                 outgoing.put_nowait(dict(req, op='infer', observation=requested))
             while True:
+                # Yield before acquiring the shared lock, including startup retries.
+                await asyncio.sleep(.001)
                 now = time.monotonic()
                 if send.done(): send.result()
                 if a.execute and select.select([sys.stdin], [], [], 0)[0]:
@@ -443,11 +454,9 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                             raise RuntimeError('External stream enabled before first publication; stop SONIC manually')
                         if not s.armed:
                             if not s.bottom(now, ('CONTROL',)) or stream != 0:
-                                await asyncio.sleep(.001)
                                 continue
                             try: s.observation_now(now)
                             except ValueError:
-                                await asyncio.sleep(.001)
                                 continue
                             s.armed = True; arm_pending = True
                             emit('automatic_hold_initialization')
@@ -515,13 +524,12 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                             if frame == 0:
                                 print('TOKEN_PUBLISHING: valid first block published. Press Enter in SONIC to enable stream.', flush=True)
                         emit('delivered' if a.execute else 'readonly_consumed', frame_index=frame,
-                             chunk_id=clock.chunk_id, index=index, token=tokens[index].tolist(),
+                             chunk_id=clock.chunk_id, index=index, token=tokens[index].tolist() if a.diagnostics == 'full' else None,
                              gripper_raw=grips[index].tolist(), gripper_applied=bool(a.execute and stream == 1),
                              external_stream=stream, schedule_lateness=now-deadline,
                              motor_execution_confirmed=False)
                         frame += 1; deadline += 1/HZ
                         if clock.ready_to_request(): request(now)
-                await asyncio.sleep(.001)
     except WarmupRetry:
         warmup_retry = True
         raise
@@ -550,6 +558,8 @@ def parse_args(argv=None):
     p.add_argument('--zmq-sub-port', type=int, default=5557)
     p.add_argument('--limits', type=Path, default=ROOT/'gear_sonic/configs/dex1_limits.g1_20261013.json')
     p.add_argument('--output', type=Path)
+    p.add_argument('--diagnostics', choices=('full', 'minimal'), default='full',
+                   help='full preserves replay inputs; minimal omits bulky images/tokens and batches log flushes')
     p.add_argument('--check', action='store_true', help='Imports/calibration only; no sensors, sockets or DDS')
     p.add_argument('--execute', action='store_true', help='Enable publishers after default-reference CONTROL; SONIC stream switch remains manual')
     a = p.parse_args(argv)
@@ -576,8 +586,8 @@ def main():
         info = json.load(f)
     validate_info(info)
     a.output.mkdir(parents=True, exist_ok=False)
-    recorder = d['Recorder'](a.output)
-    recorder.add('session.json', dict(server=info, execute=a.execute,
+    recorder = d['Recorder'](a.output, mode=a.diagnostics)
+    recorder.add('session.json', dict(server=info, execute=a.execute, diagnostics=a.diagnostics,
         limits_sha256=hashlib.sha256(a.limits.read_bytes()).hexdigest(), instruction=a.instruction,
         receiver_network_stop_closed_loop=False, gripper_hold_hardware_validated=False))
     s = Shared(); runtime = Runtime(a, d, s, limits, recorder)
