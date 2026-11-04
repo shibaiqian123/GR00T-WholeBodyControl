@@ -91,7 +91,7 @@ def install_prompt_cache(extractor):
     extractor._get_prompt_embeds = get_prompt_embeds
 
 class Policy:
-    def __init__(self, run, checkpoint, cosmos, seed=42):
+    def __init__(self, run, checkpoint, cosmos, seed=42, *, rtc_enabled=True):
         from omegaconf import OmegaConf
         from DiT4DiT.model.framework import build_framework
         from DiT4DiT.model.framework.DiT4DiT import DiT4DiT
@@ -124,12 +124,14 @@ class Policy:
         if self.feature_early_exit and not hasattr(extractor, '_transformer_feature_call'):
             raise RuntimeError('Update Cosmos25.py before enabling feature early exit')
         extractor.feature_early_exit = self.feature_early_exit
-        self.rtc = RTCActionHead(self.model.action_model)
+        self.rtc_enabled = rtc_enabled
+        self.rtc = RTCActionHead(self.model.action_model) if rtc_enabled else None
         self.info = dict(checkpoint=str(ckpt), checkpoint_sha256=sha(ckpt),
                          config_sha256=sha(run/'config.yaml'), statistics_sha256=sha(run/'dataset_statistics.json'),
                          cosmos=str(Path(cosmos).resolve()), action_shape=[50,66], token_shape=[50,64],
                          state_dim=31, inference_steps=self.model.action_model.num_inference_timesteps,
-                         rtc_mode='test_time', guidance_alpha=0.9, seed=seed,
+                         rtc_mode='test_time' if rtc_enabled else 'disabled', rtc_enabled=rtc_enabled,
+                         guidance_alpha=0.9 if rtc_enabled else 0.0, seed=seed,
                          feature_early_exit=self.feature_early_exit, prompt_cache_enabled=self.prompt_cache_enabled,
                          gripper_output_units='motor_output_radians',
                          gripper_label_mode='binary' if binary_grippers else 'continuous',
@@ -173,7 +175,7 @@ class Policy:
         ex = self.example(obs)
         torch.cuda.synchronize()
         start = time.monotonic()
-        if previous is None:
+        if not self.rtc_enabled or previous is None:
             with torch.no_grad():
                 norm = self.model.predict_action([ex])['normalized_actions'][0]
         else:

@@ -26,7 +26,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 import numpy as np
-from protocol import ConsumptionClock, HZ
+from protocol import ConsumptionClock, HZ, rtc_enabled_from_info
 
 SIDES = ('left', 'right')
 WARNING = 'Automatic network-loss stopping at SONIC is NOT closed-loop; use controller O / hardware emergency stop.'
@@ -54,8 +54,9 @@ def dependencies():
 def validate_info(info):
     if (info.get('state_dim') != 31 or info.get('action_shape') != [50, 66]
             or info.get('token_shape') != [50, 64] or info.get('control_hz') != 50
-            or info.get('rtc_mode') != 'test_time' or info.get('rtc_supported') is not True):
+            or info.get('rtc_mode') not in ('test_time', 'disabled') or info.get('rtc_supported') is not True):
         raise ValueError('Server is not the expected DiT4DiT state31/action50x66 RTC policy')
+    rtc_enabled_from_info(info)
     for k in ('checkpoint_sha256', 'config_sha256', 'statistics_sha256'):
         v = info.get(k)
         if not isinstance(v, str) or len(v) != 64 or any(c not in '0123456789abcdef' for c in v):
@@ -372,7 +373,7 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
     import websockets
     import zmq
     clock = ConsumptionClock(uuid.uuid4().hex, info['action_exec_horizon_default'],
-                             allow_compact=a.compact_replies)
+                             allow_compact=a.compact_replies, rtc_enabled=rtc_enabled_from_info(info))
     ctx = pub = None
     tasks = []
     warmup_retry = False
@@ -599,6 +600,7 @@ def main():
     with urllib.request.urlopen(f'http://{a.host}:{a.port}/info', timeout=10) as f:
         info = json.load(f)
     validate_info(info)
+    print("SAMPLING_MODE: " + info["rtc_mode"], flush=True)
     if a.image_transport == 'rgb' and 'rgb8_base64' not in info.get('image_encodings', []):
         raise ValueError('Server does not support raw RGB transport')
     if a.compact_replies and 'actions_only_v1' not in info.get('reply_formats', []):
