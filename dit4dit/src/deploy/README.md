@@ -117,3 +117,15 @@ bash dit4dit/script/deploy_dit4dit-sonic-rtc-client.sh \
 正常结束：在C++终端按 Enter返回默认参考；客户端看到流关闭后停止新token和推理请求，进入既有受保护夹爪保持并锁定。确认现场状态后Ctrl+C客户端，再按O退出底层。紧急情况使用既有O/硬件急停流程。默认参考切换、FAULT_HOLD及停止后的支撑并未验证为安全状态。
 
 客户端 `stop` 停止发布并锁定，`quit`/Ctrl+C关闭资源；关闭后夹爪软件保持结束。自动断网停控尚未闭环，客户端停止发布不等于SONIC停止控制。首目标连续性、实际采用帧确认仍未解决；本轮只有静态/内存与编译验证，没有实机验收。
+
+
+## Deployment latency optimizations (2026-11-04)
+
+- Startup polling yields outside the shared lock; heartbeat and gripper workers retain access.
+- Frozen eval-mode prompt embeddings use a single-entry, per-model deployment cache. Set `RTC_DISABLE_PROMPT_CACHE=1` before server startup for an uncached baseline; `/info` reports `prompt_cache_enabled`. Model reload creates a new cache. Training code is unchanged.
+- Exact repeated camera frames reuse PNG encoding only when image identity and source timestamp match. Body/gripper validation and original image age are retained. Already-224x224 server images skip redundant resizing.
+- Live client `--diagnostics minimal` omits request image files, chunk dumps and per-frame token arrays, but retains frame indexes, ages, timing, stream changes and faults. Log flushes are batched up to 250 ms (fault/normal close flush); abrupt process termination may lose buffered lines. Default `full` retains replay inputs.
+- No freshness, overlap, gain, limits or control deadline changes. Disable producer tracing explicitly with `unset LATENCY_TRACE_HOST LATENCY_TRACE_UDP LATENCY_TRACE_EVERY`; commented exports do not clear inherited values.
+
+Validation on 229: syntax/help checks, no await under shared lock, CPU fake prompt-cache equality/invalidation, full/minimal recorder retention and unchanged infeasible-overlap rejection. No real-camera/DDS/motor execution. Real-checkpoint latency and output equivalence remain unmeasured.
+For a read-only A/B, use the same saved observations/checkpoint/noise, keep full input records, separate warmup, compare request RTT and inference p50/p95/max plus overlap failures. Do not run an additional benchmark against a server controlling a robot. 32 receives changes only through Git; an already running server is not updated by pulling.
