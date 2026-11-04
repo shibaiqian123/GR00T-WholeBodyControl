@@ -1,3 +1,4 @@
+#include "latency_trace.hpp"
 #include "startup_audit.hpp"
 #include "readonly_decode_snapshot.hpp"
 #include "single_step_endpoint.hpp"
@@ -2801,13 +2802,18 @@ class G1Deploy {
           single_step_->receipt["dds_write_time"]=SingleStepEndpoint::now();
           single_step_->receipt["dds_target"]=mc->q_target;single_step_->save();
         }
+        const auto latency_write = mc->latency_cycle ? sonic_latency::tracer.write() : 0;
+        sonic_latency::tracer.emit("write",latency_write,"dds_command_ready",mc->latency_cycle,mc->latency_ready_ns);
+        sonic_latency::tracer.emit("write",latency_write,"dds_write_start",mc->latency_cycle);
         bool write_ok=false;
         try {write_ok=lowcmd_publisher_->Write(dds_low_command);}
         catch(const std::exception& e) {
+          sonic_latency::tracer.emit("write",latency_write,"dds_write_failed",mc->latency_cycle);
           if(target_smoother_){operator_state.stop=true;std::cerr<<"[JointTargetSmoother] DDS exception: "<<e.what()<<std::endl;return;}
           if(!single_step_)throw;
           single_step_->fail(std::string("DDS write exception: ")+e.what());operator_state.stop=true;return;
         }
+        sonic_latency::tracer.emit("write",latency_write,write_ok?"dds_write_done":"dds_write_failed",mc->latency_cycle);
         if(target_smoother_) {
           if(write_ok)last_published_motor_command_.SetData(*mc);
           else {operator_state.stop=true;std::cerr<<"[JointTargetSmoother] DDS publication failed"<<std::endl;return;}
@@ -3296,12 +3302,16 @@ class G1Deploy {
       }
       std::array<double,29> audit_previous_action=last_action;
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
+      const auto latency_cycle = sonic_latency::tracer.cycle();
+      sonic_latency::tracer.emit("cycle",latency_cycle,"sonic_decode_start");
       if (!policy_engine_->Infer()) {
+        sonic_latency::tracer.emit("cycle",latency_cycle,"sonic_decode_failed");
         if(single_step_&&(single_decode||single_return))single_step_->fail("decoder inference failed");
         std::cerr << "✗ Error: Control policy inference failed" << std::endl;
         return false;
       }
       
+      sonic_latency::tracer.emit("cycle",latency_cycle,"sonic_decode_done");
       // Access actions from control policy's internal buffer (already populated by Infer)
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
@@ -3400,6 +3410,11 @@ class G1Deploy {
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       if((joint_target_limiter_ || target_smoother_) && operator_state.stop)return false;
       if(single_step_ && operator_state.stop){single_step_->cancel();return false;}
+      if(latency_cycle) {
+        motor_command_tmp.latency_cycle=latency_cycle;
+        motor_command_tmp.latency_ready_ns=sonic_latency::mono_ns();
+        sonic_latency::tracer.emit("cycle",latency_cycle,"sonic_command_ready",0,motor_command_tmp.latency_ready_ns);
+      }
       motor_command_buffer_.SetData(motor_command_tmp);
       if(single_step_&&(single_decode||single_return)) {
         single_step_->phase=single_decode?"token_pending":"planner_pending";

@@ -518,8 +518,11 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                             action_trace = f'{clock.session}:frame:{frame}'
                             mark(action_trace, 'action_ready', at=response['_latency_accepted'], request_id=response['request_id'])
                             mark(action_trace, 'action_send', wire_frame_index=frame, request_id=response['request_id'])
-                            pub.send(d['pack_pose_message']({'token_state': tokens[index].reshape(1,64),
-                                'frame_index': np.array([frame], dtype=np.int64)}, topic='pose', version=4), flags=zmq.NOBLOCK)
+                            pose_data = {'token_state': tokens[index].reshape(1,64),
+                                         'frame_index': np.array([frame], dtype=np.int64)}
+                            if os.environ.get('LATENCY_TRACE_UDP'):
+                                pose_data['latency_session'] = np.array([int(c,16) for c in clock.session], dtype=np.int32)
+                            pub.send(d['pack_pose_message'](pose_data, topic='pose', version=4), flags=zmq.NOBLOCK)
                             if stream == 1: s.target = packet
                             if frame == 0:
                                 print('TOKEN_PUBLISHING: valid first block published. Press Enter in SONIC to enable stream.', flush=True)

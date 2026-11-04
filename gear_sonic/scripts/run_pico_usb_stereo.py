@@ -47,7 +47,10 @@ class USBSource:
                         camera_trace = uuid.uuid4().hex
                         mark(camera_trace, 'camera_request_229')
                         start=time.monotonic()
-                        sock.sendall(b'N')
+                        if os.environ.get('LATENCY_CAMERA_PROTOCOL') == '1':
+                            sock.sendall(b'T' + uuid.UUID(hex=camera_trace).bytes)
+                        else:
+                            sock.sendall(b'N')
                         size=struct.unpack('>I',read_exact(sock,4))[0]
                         if not 4 <= size <= 8*1024*1024: raise ValueError('Invalid JPEG size')
                         data=read_exact(sock,size)

@@ -43,6 +43,9 @@ struct MotorCommand {
     std::array<float, G1_NUM_MOTOR> kp = {};          ///< Position gain (Nm/rad).
     std::array<float, G1_NUM_MOTOR> kd = {};          ///< Velocity gain (Nm·s/rad).
     std::array<float, G1_NUM_MOTOR> tau_ff = {};      ///< Feed-forward torque (Nm).
+    // Internal diagnostics only; never serialized into LowCmd or CRC.
+    unsigned long long latency_cycle = 0;
+    unsigned long long latency_ready_ns = 0;
 };
 
 /**

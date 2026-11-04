@@ -1,3 +1,4 @@
+#include "latency_trace.hpp"
 #include "startup_audit.hpp"
 /**
  * @file zmq_endpoint_interface.hpp
@@ -653,6 +654,7 @@ private:
         int token_state_idx = -1;  // Protocol v4: token-only streaming
         int heading_increment_idx = -1;
         int timestamp_monotonic_idx = -1;
+        int latency_session_idx = -1;
         // VR 3-point tracking fields (optional)
         int vr_position_idx = -1, vr_orientation_idx = -1, vr_compliance_idx = -1;
         
@@ -670,6 +672,7 @@ private:
             else if (f.name == "token_state") token_state_idx = static_cast<int>(i);
             else if (f.name == "heading_increment") heading_increment_idx = static_cast<int>(i);
             else if (f.name == "timestamp_monotonic") timestamp_monotonic_idx = static_cast<int>(i);
+            else if (f.name == "latency_session") latency_session_idx = static_cast<int>(i);
             // VR 3-point tracking fields
             else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
             else if (f.name == "vr_orientation") vr_orientation_idx = static_cast<int>(i);
@@ -731,6 +734,25 @@ private:
                 return result;
             }
             
+            // Optional diagnostics only. Malformed diagnostic fields never reject a token.
+            if (sonic_latency::tracer.enabled() && latency_session_idx>=0 && frame_index_idx>=0) {
+                const auto& lf=buffered_header_.fields[static_cast<size_t>(latency_session_idx)];
+                const auto& lb=buffered_buffers_[static_cast<size_t>(latency_session_idx)];
+                const auto& ff=buffered_header_.fields[static_cast<size_t>(frame_index_idx)];
+                const auto& fb=buffered_buffers_[static_cast<size_t>(frame_index_idx)];
+                if(lf.dtype=="i32" && lb.size()==32*sizeof(int32_t) && ff.dtype=="i64" && fb.size()==sizeof(int64_t)) {
+                    char session[33]{}; bool valid=true;
+                    for(size_t j=0;j<32;++j) {
+                        int32_t v; std::memcpy(&v,lb.data()+j*sizeof(v),sizeof(v));
+                        if(needs_swap)v=byte_swap(v);
+                        if(v<0 || v>15){valid=false;break;}
+                        session[j]="0123456789abcdef"[v];
+                    }
+                    int64_t frame; std::memcpy(&frame,fb.data(),sizeof(frame));
+                    if(needs_swap)frame=byte_swap(frame);
+                    if(valid)sonic_latency::tracer.token(session,frame);
+                }
+            }
             if (startup_audit::writer().enabled()) {
                 startup_audit::Row r("token_received");r.array("token",token_data);
                 if(frame_index_idx>=0){const auto& field=buffered_header_.fields[static_cast<size_t>(frame_index_idx)];const auto& bytes=buffered_buffers_[static_cast<size_t>(frame_index_idx)];if(field.dtype=="i64" && bytes.size()>=sizeof(int64_t)){int64_t frame;std::memcpy(&frame,bytes.data(),sizeof(frame));if(needs_swap)frame=byte_swap(frame);r.scalar("send_counter",frame);}}
