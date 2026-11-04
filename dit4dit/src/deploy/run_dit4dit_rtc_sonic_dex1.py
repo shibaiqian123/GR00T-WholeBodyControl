@@ -227,12 +227,17 @@ class Runtime:
                     image_source_time = cm['timestamps']['ego_view']
                     # Only reuse the exact cached frame, never refresh its timestamp.
                     if image is not previous_image or image_source_time != previous_image_time:
-                        b = io.BytesIO()
-                        d['Image'].fromarray(np.asarray(image).copy()).resize(
-                            (224, 224), d['Image'].Resampling.BILINEAR).save(b, format='PNG')
-                        encoded_image = base64.b64encode(b.getvalue()).decode()
+                        resized = d['Image'].fromarray(np.asarray(image).copy()).resize(
+                            (224, 224), d['Image'].Resampling.BILINEAR)
+                        if a.image_transport == 'rgb':
+                            encoded_image = dict(image_encoding='rgb8_base64', image_shape=[224,224,3],
+                                image_rgb=base64.b64encode(np.asarray(resized, dtype=np.uint8).tobytes()).decode())
+                        else:
+                            b = io.BytesIO()
+                            resized.save(b, format='PNG')
+                            encoded_image = dict(image_png=base64.b64encode(b.getvalue()).decode())
                         previous_image, previous_image_time = image, image_source_time
-                    obs = dict(image_png=encoded_image,
+                    obs = dict(**encoded_image,
                                state=state.tolist(), lang=a.instruction, observation_id=uuid.uuid4().hex,
                                observed_at=image_time, saved_observation=False,
                                body_source_tick=bm['source_tick'], source_times=source_times)
@@ -366,7 +371,8 @@ async def session(a, d, s, info, limits, recorder):
 async def session_once(a, d, s, info, limits, recorder, attempt):
     import websockets
     import zmq
-    clock = ConsumptionClock(uuid.uuid4().hex, info['action_exec_horizon_default'])
+    clock = ConsumptionClock(uuid.uuid4().hex, info['action_exec_horizon_default'],
+                             allow_compact=a.compact_replies)
     ctx = pub = None
     tasks = []
     warmup_retry = False
@@ -422,7 +428,8 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                 emit('request', **req, observation_id=requested['observation_id'],
                      observed_at=requested['observed_at'], source_times=requested['source_times'])
                 recorder.add('request_' + req['request_id'] + '.json', dict(req, observation=requested))
-                outgoing.put_nowait(dict(req, op='infer', observation=requested))
+                outgoing.put_nowait(dict(req, op='infer', observation=requested,
+                                        reply_format='actions_only_v1' if a.compact_replies else 'full'))
             while True:
                 # Yield before acquiring the shared lock, including startup retries.
                 await asyncio.sleep(.001)
@@ -561,6 +568,10 @@ def parse_args(argv=None):
     p.add_argument('--zmq-sub-port', type=int, default=5557)
     p.add_argument('--limits', type=Path, default=ROOT/'gear_sonic/configs/dex1_limits.g1_20261013.json')
     p.add_argument('--output', type=Path)
+    p.add_argument('--image-transport', choices=('png', 'rgb'), default='png',
+                   help='rgb skips PNG encoding; increases network bandwidth, requires server capability')
+    p.add_argument('--compact-replies', action='store_true',
+                   help='Keep normalized RTC history on server; omit it from action replies')
     p.add_argument('--diagnostics', choices=('full', 'minimal'), default='full',
                    help='full preserves replay inputs; minimal omits bulky images/tokens and batches log flushes')
     p.add_argument('--check', action='store_true', help='Imports/calibration only; no sensors, sockets or DDS')
@@ -588,9 +599,14 @@ def main():
     with urllib.request.urlopen(f'http://{a.host}:{a.port}/info', timeout=10) as f:
         info = json.load(f)
     validate_info(info)
+    if a.image_transport == 'rgb' and 'rgb8_base64' not in info.get('image_encodings', []):
+        raise ValueError('Server does not support raw RGB transport')
+    if a.compact_replies and 'actions_only_v1' not in info.get('reply_formats', []):
+        raise ValueError('Server does not support compact replies')
     a.output.mkdir(parents=True, exist_ok=False)
     recorder = d['Recorder'](a.output, mode=a.diagnostics)
-    recorder.add('session.json', dict(server=info, execute=a.execute, diagnostics=a.diagnostics,
+    recorder.add('session.json', dict(server=info, execute=a.execute, diagnostics=a.diagnostics, image_transport=a.image_transport,
+        compact_replies=a.compact_replies,
         limits_sha256=hashlib.sha256(a.limits.read_bytes()).hexdigest(), instruction=a.instruction,
         receiver_network_stop_closed_loop=False, gripper_hold_hardware_validated=False))
     s = Shared(); runtime = Runtime(a, d, s, limits, recorder)
