@@ -62,7 +62,12 @@ def validate_info(info):
         if not isinstance(v, str) or len(v) != 64 or any(c not in '0123456789abcdef' for c in v):
             raise ValueError('Missing resource hash: ' + k)
     horizon = info.get('action_exec_horizon_default')
-    if type(horizon) is not int or not 1 <= horizon < 50:
+    execution_mode = info.get('execution_mode', 'async')
+    if execution_mode not in ('sync', 'async'):
+        raise ValueError('Unknown execution mode')
+    if execution_mode == 'sync' and rtc_enabled_from_info(info):
+        raise ValueError('Synchronous execution requires ordinary sampling')
+    if type(horizon) is not int or not (1 <= horizon <= 50 if execution_mode == 'sync' else 1 <= horizon < 50):
         raise ValueError('Invalid server action_exec_horizon')
     return horizon
 
@@ -74,7 +79,7 @@ def validate_reply(result, requested, info, limits):
         raise ValueError('Reply observation provenance mismatch')
     resources = result.get('resources', {})
     for key in ('checkpoint_sha256', 'config_sha256', 'statistics_sha256',
-                'state_dim', 'action_shape', 'token_shape', 'rtc_mode', 'inference_steps'):
+                'state_dim', 'action_shape', 'token_shape', 'rtc_mode', 'inference_steps', 'execution_mode'):
         if resources.get(key) != info.get(key):
             raise ValueError('Server resources changed: ' + key)
     token = np.asarray(result['motion_tokens'], dtype=np.float32)
@@ -372,8 +377,10 @@ async def session(a, d, s, info, limits, recorder):
 async def session_once(a, d, s, info, limits, recorder, attempt):
     import websockets
     import zmq
+    synchronous = info.get('execution_mode', 'async') == 'sync'
     clock = ConsumptionClock(uuid.uuid4().hex, info['action_exec_horizon_default'],
-                             allow_compact=a.compact_replies, rtc_enabled=rtc_enabled_from_info(info))
+                             allow_compact=a.compact_replies, rtc_enabled=rtc_enabled_from_info(info),
+                             synchronous=synchronous)
     ctx = pub = None
     tasks = []
     warmup_retry = False
@@ -413,8 +420,10 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
             tasks = [send, receive]
             requested = None; request_time = None; deadline = None
             response = tokens = grips = None
+            completed_after = None
             running = not a.execute; arm_pending = False; frame = 0; blocks = 0
             stream_seen = False; last_receive = None; last_stream = None
+            startup_stream_wait = False
             wait_start = time.monotonic()
             print('Commands: stop, quit. Waiting for default-reference CONTROL; no arm/run needed.', flush=True)
             def request(now):
@@ -459,7 +468,25 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                         if hb and (type(stream) is not int or stream not in (0, 1)):
                             raise RuntimeError('Missing/unknown external_stream; rebuild SONIC before enabling')
                         if s.bottom(now, ('CONTROL',)) and stream == 1 and frame == 0:
-                            raise RuntimeError('External stream enabled before first publication; stop SONIC manually')
+                            if s.armed:
+                                # State changed after arming: never take over an active stream.
+                                raise RuntimeError('External stream enabled before first publication; stop SONIC manually')
+                            # A new client may attach to a still-running SONIC process.
+                            # Wait unarmed rather than permanently faulting the new session.
+                            if not startup_stream_wait:
+                                print('WAIT_EXTERNAL_STREAM_OFF: SONIC already reports external_stream=1 '
+                                      f'(heartbeat seq={hb.get("seq")}, token_ready={hb.get("token_ready")}). '
+                                      'No action is being sent. In the SONIC terminal press Enter once '
+                                      'to disable streaming; this client will continue automatically. '
+                                      'Enable streaming again only after TOKEN_PUBLISHING.', flush=True)
+                                emit('startup_wait_external_stream_off', heartbeat=dict(hb),
+                                     action_delivery=False)
+                                startup_stream_wait = True
+                            continue
+                        if startup_stream_wait and s.bottom(now, ('CONTROL',)) and stream == 0:
+                            print('STARTUP_RESUMED: external_stream=0; preparing the first action block.', flush=True)
+                            emit('startup_stream_off_observed', heartbeat=dict(hb))
+                            startup_stream_wait = False
                         if not s.armed:
                             if not s.bottom(now, ('CONTROL',)) or stream != 0:
                                 continue
@@ -509,17 +536,21 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                         print(f'Received action: chunk={clock.chunk_id} age={age:.3f}s external_stream={stream}; recv_action interval={interval}', flush=True)
                         last_receive = now
                         emit('accepted', chunk_id=clock.chunk_id, skipped_prefix=clock.position, observation_age=age)
-                        if deadline is None: deadline = now
+                        if deadline is None or synchronous: deadline = now
+                        if synchronous: completed_after = None
                         receive = asyncio.create_task(receiver()); tasks = [send, receive]
                     if clock.pending is not None and now-request_time > 10:
                         raise TimeoutError('Inference timeout; no automatic retry')
                     if deadline is not None and now >= deadline:
                         if now-deadline >= 1/HZ: raise RuntimeError('Missed whole control tick; no burst catch-up')
                         s.observation_now(now)
-                        if not 0 <= now-response['observed_at'] < 1.0: raise RuntimeError('Action block observation expired')
                         if a.execute and not s.bottom(now, ('CONTROL',)): raise RuntimeError('Bottom not CONTROL')
                         if a.execute and s.grip_phase != 'READY': raise RuntimeError('Dex1 not READY')
-                        index = clock.consume()
+                        # Psi0-style scheduling: drain the selected prefix before the next request.
+                        # Waiting repeats the last target; a motion token is NOT a pose hold.
+                        sync_wait = synchronous and clock.position == clock.horizon
+                        sync_prefill = synchronous and a.execute and stream != 1
+                        index = clock.horizon-1 if sync_wait else (0 if sync_prefill else clock.consume())
                         packet = control_packet(s, 'model', now, grips[index])
                         packet = d['target_to_trigger'](packet, limits, now)
                         if a.execute:
@@ -534,13 +565,25 @@ async def session_once(a, d, s, info, limits, recorder, attempt):
                             if stream == 1: s.target = packet
                             if frame == 0:
                                 print('TOKEN_PUBLISHING: valid first block published. Press Enter in SONIC to enable stream.', flush=True)
-                        emit('delivered' if a.execute else 'readonly_consumed', frame_index=frame,
+                        kind = ('sync_wait_target' if sync_wait else 'sync_prefill') if (sync_wait or sync_prefill) else ('delivered' if a.execute else 'readonly_consumed')
+                        emit(kind, frame_index=frame,
                              chunk_id=clock.chunk_id, index=index, token=tokens[index].tolist() if a.diagnostics == 'full' else None,
                              gripper_raw=grips[index].tolist(), gripper_applied=bool(a.execute and stream == 1),
                              external_stream=stream, schedule_lateness=now-deadline,
                              motor_execution_confirmed=False)
                         frame += 1; deadline += 1/HZ
-                        if clock.ready_to_request(): request(now)
+                        if synchronous:
+                            if not sync_wait and not sync_prefill and clock.position == clock.horizon:
+                                completed_after = deadline
+                                emit('sync_block_complete', chunk_id=clock.chunk_id, completed_after=completed_after)
+                            # Wait a full final control tick and obtain fresh image/body/gripper samples.
+                            if sync_wait and clock.ready_to_request():
+                                obs = s.observation_now(now)
+                                if min(obs['source_times']) > completed_after:
+                                    request(now)
+                                elif now-completed_after > 10:
+                                    raise TimeoutError('No fresh observation after synchronous block')
+                        elif clock.ready_to_request(): request(now)
     except WarmupRetry:
         warmup_retry = True
         raise
@@ -601,6 +644,9 @@ def main():
         info = json.load(f)
     validate_info(info)
     print("SAMPLING_MODE: " + info["rtc_mode"], flush=True)
+    print("EXECUTION_MODE: " + info.get("execution_mode", "async"), flush=True)
+    if info.get("execution_mode") == "sync":
+        print(f"SYNC: consume first {info['action_exec_horizon_default']} of 50 rows; repeat last executed token/gripper target while waiting (not a stationary pose hold).", flush=True)
     if a.image_transport == 'rgb' and 'rgb8_base64' not in info.get('image_encodings', []):
         raise ValueError('Server does not support raw RGB transport')
     if a.compact_replies and 'actions_only_v1' not in info.get('reply_formats', []):
@@ -608,7 +654,7 @@ def main():
     a.output.mkdir(parents=True, exist_ok=False)
     recorder = d['Recorder'](a.output, mode=a.diagnostics)
     recorder.add('session.json', dict(server=info, execute=a.execute, diagnostics=a.diagnostics, image_transport=a.image_transport,
-        compact_replies=a.compact_replies,
+        compact_replies=a.compact_replies, execution_mode=info.get('execution_mode', 'async'),
         limits_sha256=hashlib.sha256(a.limits.read_bytes()).hexdigest(), instruction=a.instruction,
         receiver_network_stop_closed_loop=False, gripper_hold_hardware_validated=False))
     s = Shared(); runtime = Runtime(a, d, s, limits, recorder)

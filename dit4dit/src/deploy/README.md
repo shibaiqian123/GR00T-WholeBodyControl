@@ -218,3 +218,39 @@ each deployment copy; fake Policy calls proving every no-RTC request selects
 ordinary sampling, plus live-client metadata validation. No repository test
 programs were added. Actual checkpoint latency, boundary continuity and physical
 behavior remain unmeasured. All edits are made on229;32 receives Git pulls only.
+
+
+## Synchronous mode with selectable execution length (2026-11-07)
+
+The actual `deploy_dit4dit-sonic-rtc-client.sh` wrapper defaults to this directory.
+The client follows `execution_mode` advertised by the DiT4DiT server. Start the
+updated server with `--sync --sync-steps N` to execute the first N rows before
+requesting the next chunk (N=1..50, default 50); `--no-rtc` alone remains asynchronous. protocol.py is the deployment copy
+of `/home/cqu023/DiT4DiT/rtc_deploy/protocol.py` and must stay identical.
+See that canonical README's synchronous section for the inspected Psi0 reference,
+wire contract and test results. During inference gaps the client repeats the last executed
+SONIC token and physical Dex1 target; this is not a stationary joint pose hold.
+No sensors, publishers or motors were exercised during validation. Run the updated
+client without --execute for read-only consumption first. Existing launch flags
+and manual SONIC stream enabling remain in use.
+
+
+## Startup with an already-enabled SONIC stream (2026-11-07)
+
+Before arming or publishing any frame, a fresh CONTROL heartbeat with
+external_stream=1 now enters WAIT_EXTERNAL_STREAM_OFF instead of latching a
+terminal fault. This state does not arm Dex1, send a model request, or publish
+action tokens. It prints the reported heartbeat sequence and token readiness.
+Disable streaming in the SONIC terminal (Enter toggles it); a fresh CONTROL /
+external_stream=0 heartbeat resumes initialization automatically. Wait for
+TOKEN_PUBLISHING before enabling streaming again. The client never remotely
+toggles the robot's active control mode. If streaming becomes enabled after
+arming but before the first publication, the original fault remains in force.
+
+Evidence: the 171642 client log began with a fresh seq=327470 CONTROL heartbeat,
+external_stream=1, token_ready=false. The SONIC process had been running since
+15:27:20; this was not evidence of a new key press in that client run. Existing
+stream state survives client termination. No claim is made about what originally
+changed the switch. The startup-wait recovery plus sync playback regressions pass
+in test_sync_client with fake time, heartbeats and publishers; no live motors or
+SONIC processes were restarted or controlled during this fix.
