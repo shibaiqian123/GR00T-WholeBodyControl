@@ -9,6 +9,10 @@ TEXT_CACHE="${WBWAM_TEXT_CACHE:?Set WBWAM_TEXT_CACHE to the exact 192x4096 promp
 CHECKPOINT_STEP="${WBWAM_CHECKPOINT_STEP:-5000}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
+if [[ "$PYTHON_BIN" == */* ]]; then
+  export PATH="$(dirname -- "$PYTHON_BIN"):$PATH"
+fi
+
 if [[ -f "$WBWAM_ROOT/training/scripts/load_env.sh" ]]; then
   # shellcheck source=/dev/null
   source "$WBWAM_ROOT/training/scripts/load_env.sh"
