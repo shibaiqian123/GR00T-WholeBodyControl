@@ -292,3 +292,6 @@ Thumbs.db
 !decoupled_wbc/tests/**/*.hdf5
 !decoupled_wbc/tests/**/*.h5
 !decoupled_wbc/tests/**/*.parquet
+
+
+WB-WAM/inference_assets/run*/
