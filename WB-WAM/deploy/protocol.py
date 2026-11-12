@@ -9,6 +9,8 @@ MODEL_ACTION_DIM = 66
 MODEL_HZ = 20
 EXEC_HORIZON = 50
 EXEC_HZ = 50
+DEX1_OUTPUT_MIN_RAD = 0.15
+DEX1_OUTPUT_MAX_RAD = 5.3
 
 
 def validate_native_actions(value) -> np.ndarray:
@@ -16,6 +18,19 @@ def validate_native_actions(value) -> np.ndarray:
     expected = (MODEL_HORIZON, MODEL_ACTION_DIM)
     if actions.shape != expected or not np.isfinite(actions).all():
         raise ValueError(f"expected finite native actions {expected}, got {actions.shape}")
+    return actions
+
+
+def clip_dex1_targets(value) -> np.ndarray:
+    """Clip only the final two denormalized motor targets in an action array."""
+    actions = np.asarray(value, dtype=np.float32).copy()
+    if actions.ndim < 1 or actions.shape[-1] != MODEL_ACTION_DIM:
+        raise ValueError(f"expected actions ending in {MODEL_ACTION_DIM}, got {actions.shape}")
+    if not np.isfinite(actions).all():
+        raise ValueError("actions contain NaN/Inf")
+    actions[..., 64:66] = np.clip(
+        actions[..., 64:66], DEX1_OUTPUT_MIN_RAD, DEX1_OUTPUT_MAX_RAD
+    )
     return actions
 
 

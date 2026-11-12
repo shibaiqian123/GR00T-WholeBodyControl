@@ -14,11 +14,14 @@ import numpy as np
 from PIL import Image
 
 from protocol import (
+    DEX1_OUTPUT_MAX_RAD,
+    DEX1_OUTPUT_MIN_RAD,
     EXEC_HORIZON,
     EXEC_HZ,
     MODEL_ACTION_DIM,
     MODEL_HORIZON,
     MODEL_HZ,
+    clip_dex1_targets,
     validate_execution_actions,
     zero_order_hold_20hz_to_50hz,
 )
@@ -197,6 +200,7 @@ class Policy:
             "seed": self.seed,
             "gripper_output_units": "motor_output_radians",
             "gripper_label_mode": "continuous",
+            "gripper_output_clip_rad": [DEX1_OUTPUT_MIN_RAD, DEX1_OUTPUT_MAX_RAD],
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         }
 
@@ -241,6 +245,7 @@ class Policy:
         normalized_native = prediction.float().cpu().numpy()
         normalized_execution, source_indices = zero_order_hold_20hz_to_50hz(normalized_native)
         native = self.normalizer.denormalize_action(prediction.unsqueeze(0)).float().cpu().numpy()[0]
+        native = clip_dex1_targets(native)
         execution, _ = zero_order_hold_20hz_to_50hz(native)
         execution = validate_execution_actions(execution)
         if np.max(np.abs(execution[:, :64])) > 1.25:
